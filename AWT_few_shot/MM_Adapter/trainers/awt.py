@@ -164,7 +164,7 @@ class CustomCLIP(nn.Module):
 
         return prompts.reshape(len(classnames), cfg.LLM.Num_desc+1, 77).cuda()
 
-    def forward(self, image):
+    def forward(self, image, label, lambda_mixup=0.5):
         # forward function for training
         # image: batch size x aug time x 3 x 224 x 224
         bs, aug_time, _, _, _ = image.shape
@@ -177,6 +177,11 @@ class CustomCLIP(nn.Module):
         image_features = self.clip_model.encode_image(image, self.visual_adapter_learner)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
+        # Mixup for image features
+        perm_idx = torch.randperm(image_features.size(0))
+        image_features_mixed_tea = lambda_mixup * image_features_tea + (1 - lambda_mixup) * image_features_tea[perm_idx]
+        image_features_mixed = lambda_mixup * image_features + (1 - lambda_mixup) * image_features[perm_idx]
+        
         # sample sub-set texts for efficient training
         sample_idx = torch.randperm(self.texts.size(1)-1)[:self.desc_per_batch-1]
         sub_texts = torch.cat([
@@ -191,12 +196,18 @@ class CustomCLIP(nn.Module):
         text_features = self.clip_model.encode_text(sub_texts, self.text_adapter_learner)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
+        # Mixup for text features
+        perm_idx_text = torch.randperm(text_features.size(0))
+        text_features_mixed_tea = lambda_mixup * text_features_tea + (1 - lambda_mixup) * text_features_tea[perm_idx_text]
+        text_features_mixed = lambda_mixup * text_features + (1 - lambda_mixup) * text_features[perm_idx_text]
+        import pdb; pdb.set_trace()
+        
         # (bs x aug_time) x (n_cls x self.desc_per_batch)
-        logits = self.logit_scale.exp() * image_features @ text_features.t()
+        logits = self.logit_scale.exp() * image_features_mixed @ text_features_mixed.t()
         logits = logits.reshape(bs, aug_time, self.n_cls, self.desc_per_batch).permute(0, 1, 3, 2).contiguous()
         wass_dist = Wasserstein_Distance(logits, self.logit_scale, True) # bs x n_cls
 
-        return wass_dist, image_features, text_features, image_features_tea, text_features_tea
+        return wass_dist, image_features_mixed, text_features_mixed, image_features_mixed_tea, text_features_mixed_tea
     
     @torch.no_grad()
     def get_text_features(self, ):
@@ -255,7 +266,7 @@ class AWT(TrainerX):
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-        output, img_feat_stu, text_feat_stu, img_feat_tea, text_feat_tea = self.model(image)
+        output, img_feat_stu, text_feat_stu, img_feat_tea, text_feat_tea = self.model(image, label)
         loss_ce = F.cross_entropy(output, label)
         # the distil coef may be tuned for different shots or datasets to achieve better results
         # we mainly choose from { (10.0, 25.0) (10.0, 10.0) (50.0, 50.0) }

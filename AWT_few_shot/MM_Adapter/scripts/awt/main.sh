@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # custom config
-DATA=/data3/zhuyuhan/CoOp_dataset
+DATA=/data2/yhiro/data
 TRAINER=AWT
 
 DATASET=$1
