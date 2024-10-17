@@ -2,6 +2,7 @@
 
 # custom config
 DATA=/data2/yhiro/data
+DATA=~/CoOp_/data/
 TRAINER=AWT
 
 DATASET=$1
