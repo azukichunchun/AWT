@@ -2,6 +2,8 @@ import os.path as osp
 from copy import deepcopy
 import json
 from tqdm import tqdm
+from itertools import groupby
+import random
 
 import torch
 import torch.nn as nn
@@ -193,16 +195,32 @@ class CustomCLIP(nn.Module):
 
         # Mixup for image features
         alpha = 1.0
-        perm_idx = torch.randperm(image_features.size(0))
+        original_list = label.repeat_interleave(aug_time).tolist()
+
+        grouped_values = []
+        grouped_indices = []
+        for _, group in groupby(enumerate(original_list), key=lambda x: x[1]):
+            group = list(group)
+            grouped_values.append([x[1] for x in group])  # 値
+            grouped_indices.append([x[0] for x in group])  # インデックス
+
+        # 値のサブリストとインデックスを同じ順番でシャッフル
+        combined = list(zip(grouped_values, grouped_indices))
+        random.shuffle(combined)
+        shuffled_values = [item for group, _ in combined for item in group]
+        shuffled_indices = [idx for _, indices in combined for idx in indices]
+
+        perm_idx = torch.tensor(shuffled_indices)
+
+        # クラスごとにまとめる（順番に並べ替える）
+        shuffled_labels = [shuffled_values[i*aug_time] for i in range(len(label))]
+        shuffled_labels = torch.tensor(shuffled_labels)
+                
         lam = torch.distributions.beta.Beta(alpha, alpha).sample().item()
 
         image_features_mixed = lam * image_features + (1 - lam) * image_features[perm_idx]
         image_features_mixed_tea = lam * image_features_tea + (1 - lam) * image_features_tea[perm_idx]
-        import pdb; pdb.set_trace()
-        #label_a = label.repeat_interleave(aug_time); label_b = [l.interleave(aug_time) for l in label[perm_idx]]
-
-        label_a = label; label_b = label[perm_idx]
-
+        
         # sample sub-set texts for efficient training
         sample_idx = torch.randperm(self.texts.size(1)-1)[:self.desc_per_batch-1]
 
@@ -222,20 +240,17 @@ class CustomCLIP(nn.Module):
         # student model
         text_features = self.clip_model.encode_text(sub_texts, self.text_adapter_learner)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
-        # Mixup for text features
-        ## image_featuresと一致するようにperm_idxを作成
-        ## 言語特徴量は全てのクラス分計算されているので、その中から画像特徴量のクラスと一致する特徴量のみmixupする
-
-        text_features_mixed = lam * text_features + (1 - lam) * text_features[perm_idx]
-        text_features_mixed_tea = lam * text_features_tea + (1 - lam) * text_features_tea[perm_idx]
-        
+       
         # (bs x aug_time) x (n_cls x self.desc_per_batch)
-        logits = self.logit_scale.exp() * image_features_mixed @ text_features_mixed.t()
+        logits = self.logit_scale.exp() * image_features_mixed @ text_features.t()
         logits = logits.reshape(bs, aug_time, self.n_cls, self.desc_per_batch).permute(0, 1, 3, 2).contiguous()
         wass_dist = Wasserstein_Distance(logits, self.logit_scale, True) # bs x n_cls
 
-        return wass_dist, image_features_mixed, text_features_mixed, image_features_mixed_tea, text_features_mixed_tea, label_a, label_b, lam
+        # 不要なテンソルを削除してメモリを解放
+        del image_features, image_features_tea, sub_texts
+        torch.cuda.empty_cache()
+
+        return wass_dist, image_features_mixed, text_features, image_features_mixed_tea, text_features_tea, shuffled_labels, lam
         
     @torch.no_grad()
     def get_text_features(self, ):
@@ -294,9 +309,10 @@ class AWT(TrainerX):
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-        output, img_feat_stu, text_feat_stu, img_feat_tea, text_feat_tea, label_a, label_b, lam = self.model(image, label)
-        import pdb; pdb.set_trace()
-        loss_ce = F.cross_entropy(output, label)
+        output, img_feat_stu, text_feat_stu, img_feat_tea, text_feat_tea, shuffled_labels, lam = self.model(image, label)
+        
+        loss_ce = lam * F.cross_entropy(output, label) + (1-lam) * F.cross_entropy(output, shuffled_labels.to(self.device))
+
         # the distil coef may be tuned for different shots or datasets to achieve better results
         # we mainly choose from { (10.0, 25.0) (10.0, 10.0) (50.0, 50.0) }
         loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu,
