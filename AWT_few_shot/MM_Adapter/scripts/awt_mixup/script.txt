@@ -1,0 +1,12 @@
+bash scripts/awt_mixup/run_full_exp.sh caltech101 &&
+bash scripts/awt_mixup/run_full_exp.sh dtd &&
+bash scripts/awt_mixup/run_full_exp.sh eurosat &&
+bash scripts/awt_mixup/run_full_exp.sh fgvc_aircraft &&
+bash scripts/awt_mixup/run_full_exp.sh food101 &&
+bash scripts/awt_mixup/run_full_exp.sh imagenet
+
+bash scripts/awt_mixup/run_full_exp.sh oxford_flowers &&
+bash scripts/awt_mixup/run_full_exp.sh oxford_pets &&
+bash scripts/awt_mixup/run_full_exp.sh stanford_cars &&
+bash scripts/awt_mixup/run_full_exp.sh sun397 &&
+bash scripts/awt_mixup/run_full_exp.sh ucf101

@@ -2,6 +2,8 @@ import os.path as osp
 from copy import deepcopy
 import json
 from tqdm import tqdm
+from itertools import groupby
+import random
 
 import torch
 import torch.nn as nn
@@ -164,7 +166,21 @@ class CustomCLIP(nn.Module):
 
         return prompts.reshape(len(classnames), cfg.LLM.Num_desc+1, 77).cuda()
 
-    def forward(self, image):
+
+    def mixup(self, x, label, perm_idx, alpha=1.0):
+        if alpha > 0:
+            lam = torch.distributions.beta.Beta(alpha, alpha).sample().item()
+        else:
+            lam = 1.0
+
+        x_mixed = lam * x + (1 - lam) * x[perm_idx]
+        y_a = label
+        y_b = label[perm_idx]
+
+        return x_mixed, (y_a, y_b, lam)
+
+
+    def forward(self, image, label, alpha=1.0):
         # forward function for training
         # image: batch size x aug time x 3 x 224 x 224
         bs, aug_time, _, _, _ = image.shape
@@ -177,12 +193,41 @@ class CustomCLIP(nn.Module):
         image_features = self.clip_model.encode_image(image, self.visual_adapter_learner)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
+        # Mixup for image features
+        alpha = 1.0
+        original_list = label.repeat_interleave(aug_time).tolist()
+
+        grouped_values = []
+        grouped_indices = []
+        for _, group in groupby(enumerate(original_list), key=lambda x: x[1]):
+            group = list(group)
+            grouped_values.append([x[1] for x in group])  # 値
+            grouped_indices.append([x[0] for x in group])  # インデックス
+
+        # 値のサブリストとインデックスを同じ順番でシャッフル
+        combined = list(zip(grouped_values, grouped_indices))
+        random.shuffle(combined)
+        shuffled_values = [item for group, _ in combined for item in group]
+        shuffled_indices = [idx for _, indices in combined for idx in indices]
+
+        perm_idx = torch.tensor(shuffled_indices)
+
+        # クラスごとにまとめる（順番に並べ替える）
+        shuffled_labels = [shuffled_values[i*aug_time] for i in range(len(label))]
+        shuffled_labels = torch.tensor(shuffled_labels)
+
+        lam = torch.distributions.beta.Beta(alpha, alpha).sample().item()
+
+        image_features_mixed = lam * image_features + (1 - lam) * image_features[perm_idx]
+        image_features_mixed_tea = lam * image_features_tea + (1 - lam) * image_features_tea[perm_idx]
+        
         # sample sub-set texts for efficient training
         sample_idx = torch.randperm(self.texts.size(1)-1)[:self.desc_per_batch-1]
+
         sub_texts = torch.cat([
                 self.texts[:, :1], self.texts[:, 1:][:, sample_idx]
             ], dim=1).reshape(-1, 77)
-        
+
         # teacher model
         with torch.no_grad():
             text_features_tea = self.clip_model.encode_text(sub_texts)
@@ -190,14 +235,18 @@ class CustomCLIP(nn.Module):
         # student model
         text_features = self.clip_model.encode_text(sub_texts, self.text_adapter_learner)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-
+       
         # (bs x aug_time) x (n_cls x self.desc_per_batch)
-        logits = self.logit_scale.exp() * image_features @ text_features.t()
+        logits = self.logit_scale.exp() * image_features_mixed @ text_features.t()
         logits = logits.reshape(bs, aug_time, self.n_cls, self.desc_per_batch).permute(0, 1, 3, 2).contiguous()
         wass_dist = Wasserstein_Distance(logits, self.logit_scale, True) # bs x n_cls
 
-        return wass_dist, image_features, text_features, image_features_tea, text_features_tea
-    
+        # 不要なテンソルを削除してメモリを解放
+        del image_features, image_features_tea, sub_texts
+        torch.cuda.empty_cache()
+
+        return wass_dist, image_features_mixed, text_features, image_features_mixed_tea, text_features_tea, shuffled_labels, lam
+        
     @torch.no_grad()
     def get_text_features(self, ):
         text_features = self.clip_model.encode_text(self.texts.reshape(-1, 77), self.text_adapter_learner)
@@ -222,7 +271,7 @@ class CustomCLIP(nn.Module):
 
 
 @TRAINER_REGISTRY.register()
-class AWT(TrainerX):
+class AWT_MIXUP(TrainerX):
 
     def check_cfg(self, cfg):
         assert cfg.TRAINER.COOP.PREC in ["fp16", "fp32", "amp"]
@@ -255,8 +304,10 @@ class AWT(TrainerX):
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-        output, img_feat_stu, text_feat_stu, img_feat_tea, text_feat_tea = self.model(image)
-        loss_ce = F.cross_entropy(output, label)
+        output, img_feat_stu, text_feat_stu, img_feat_tea, text_feat_tea, shuffled_labels, lam = self.model(image, label)
+        
+        loss_ce = lam * F.cross_entropy(output, label) + (1-lam) * F.cross_entropy(output, shuffled_labels.to(self.device))
+
         # the distil coef may be tuned for different shots or datasets to achieve better results
         # we mainly choose from { (10.0, 25.0) (10.0, 10.0) (50.0, 50.0) }
         loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu,
