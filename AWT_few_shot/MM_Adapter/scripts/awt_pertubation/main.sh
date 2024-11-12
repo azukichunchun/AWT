@@ -3,14 +3,13 @@
 # custom config
 DATA=/data2/yhiro/data
 DATA=~/CoOp_/data/
-TRAINER=AWT
+TRAINER=AWT_PERTUBATION
 
 DATASET=$1
 CFG=$2  # config file
 SHOTS=$3  # number of shots (1, 2, 4, 8, 16)
 
-#for SEED in 1 2 3
-for SEED in 4
+for SEED in 1
 do
     DIR=output/${DATASET}/${TRAINER}/${CFG}_${SHOTS}shots/seed${SEED}
     if [ -d "$DIR" ]; then
