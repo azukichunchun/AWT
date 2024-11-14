@@ -46,7 +46,7 @@ def optimal_transport(logits, logit_scale, image_weights, text_weights):
     eps = 0.1
     sim = logits / logit_scale.exp()
     sim = sim.permute(0, 3, 1, 2).reshape(bs*n_cls, aug_time, n_des) # (bs*n_cls) x aug_time x n_des
-
+    
     wdist = 1.0 - sim
     with torch.no_grad():
         KK = torch.exp(-wdist / eps)

@@ -149,14 +149,13 @@ class CustomCLIP(nn.Module):
                 "text_adapter_learner": self.text_adapter_learner
             })
 
-        self.proj1_visual = nn.Linear(clip_model.ln_final.weight.shape[0], clip_model.ln_final.weight.shape[0])
-        self.proj2_visual = nn.Linear(clip_model.ln_final.weight.shape[0], clip_model.ln_final.weight.shape[0])
+        ndim = clip_model.ln_final.weight.shape[0]
 
-        self.proj1_text = nn.Linear(clip_model.ln_final.weight.shape[0], clip_model.ln_final.weight.shape[0])
-        self.proj2_text = nn.Linear(clip_model.ln_final.weight.shape[0], clip_model.ln_final.weight.shape[0])
+        self.proj1_visual = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
+        self.proj2_visual = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
 
-        # self.visual_pertub_module = GaussPertubation(clip_model.ln_final.weight.shape[0])
-        # self.text_pertub_module = GaussPertubation(clip_model.ln_final.weight.shape[0])
+        self.proj1_text = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
+        self.proj2_text = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
 
         self.clip_model = clip_model
         self.logit_scale = clip_model.logit_scale
@@ -197,10 +196,26 @@ class CustomCLIP(nn.Module):
 
         return prompts.reshape(len(classnames), cfg.LLM.Num_desc+1, 77).cuda()
 
+    def augment_features(self, features, mu, log_std, aug_time=8):
+        # augment features by pertubation
+        features_aug = []
+        for i in range(aug_time):
+            # get pertubation noise by reparameterization trick
+            # sample eps from gauss distribution N(0, 1)
+            eps = torch.randn_like(mu)
+            e = mu + eps * log_std.exp()
+            #e = e / e.norm(dim=-1, keepdim=True)
+            h = features + F.softplus(e)
+            h = h / h.norm(dim=-1, keepdim=True)
+            features_aug.extend(h)
+
+        return torch.stack(features_aug)
+
     def forward(self, image):
         # forward function for training
         # image: batch size x aug time x 3 x 224 x 224
         bs, aug_time, _, _, _ = image.shape
+        aug_time = 1
         image = image.reshape(-1, 3, 224, 224)
         # teacher model
         with torch.no_grad():
@@ -209,7 +224,7 @@ class CustomCLIP(nn.Module):
         # student model
         image_features = self.clip_model.encode_image(image, self.visual_adapter_learner)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
+        
         # sample sub-set texts for efficient training
         sample_idx = torch.randperm(self.texts.size(1)-1)[:self.desc_per_batch-1]
         sub_texts = torch.cat([
@@ -223,15 +238,30 @@ class CustomCLIP(nn.Module):
         # student model
         text_features = self.clip_model.encode_text(sub_texts, self.text_adapter_learner)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-        import pdb; pdb.set_trace()
-        # augment visual and text features
-        image_features_aug = self.visual_pertub_module(image_features)
-        text_features_aug = self.text_pertub_module(text_features)
-        print(f"image_featurs: {image_features.shape}, image_features_aug: {image_features_aug.shape}")
+
+        # average text features for augments
+        assert text_features.size(0) == bs * self.desc_per_batch
+        text_features = text_features.reshape(bs, self.desc_per_batch, -1).mean(dim=1)
+        text_features_tea = text_features_tea.reshape(bs, self.desc_per_batch, -1).mean(dim=1)
+
+        # calc mu and log_std for pertubation
+        mu_visual = self.proj1_visual(image_features)
+        log_std_visual = self.proj2_visual(image_features)
+        mu_text = self.proj1_text(text_features)
+        log_std_text = self.proj2_text(text_features)
+
+        print(f"mu_visual: {mu_visual.mean()}, log_std_visual: {log_std_visual.mean()}")
+
+        # augment features by pertubation
+        image_features = self.augment_features(image_features, mu_visual, log_std_visual, aug_time)
+        text_features = self.augment_features(text_features, mu_text, log_std_text, aug_time)
+        image_features_tea = self.augment_features(image_features_tea, mu_visual, log_std_visual, aug_time)
+        text_features_tea = self.augment_features(text_features_tea, mu_text, log_std_text, aug_time)
 
         # (bs x aug_time) x (n_cls x self.desc_per_batch)
         logits = self.logit_scale.exp() * image_features @ text_features.t()
-        logits = logits.reshape(bs, aug_time, self.n_cls, self.desc_per_batch).permute(0, 1, 3, 2).contiguous()
+        #logits = logits.reshape(bs, aug_time, self.n_cls, self.desc_per_batch).permute(0, 1, 3, 2).contiguous()
+        logits = logits.reshape(bs, aug_time, self.n_cls, aug_time).permute(0, 1, 3, 2).contiguous()
         wass_dist = Wasserstein_Distance(logits, self.logit_scale, True) # bs x n_cls
 
         return wass_dist, image_features, text_features, image_features_tea, text_features_tea
