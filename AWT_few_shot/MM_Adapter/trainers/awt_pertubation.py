@@ -144,18 +144,22 @@ class CustomCLIP(nn.Module):
         else:
             self.text_adapter_learner = None
 
-        self.adapter_learners = nn.ModuleDict({
-                "visual_adapter_learner": self.visual_adapter_learner,
-                "text_adapter_learner": self.text_adapter_learner
-            })
-
         ndim = clip_model.ln_final.weight.shape[0]
 
-        self.proj1_visual = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
-        self.proj2_visual = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
+        self.emb1_visual = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
+        self.emb2_visual = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
 
-        self.proj1_text = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
-        self.proj2_text = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
+        self.emb1_text = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
+        self.emb2_text = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
+
+        self.adapter_learners = nn.ModuleDict({
+                "visual_adapter_learner": self.visual_adapter_learner,
+                "text_adapter_learner": self.text_adapter_learner,
+                "emb1_visual": self.emb1_visual,
+                "emb2_visual": self.emb2_visual,
+                "emb1_text": self.emb1_text,
+                "emb2_text": self.emb2_text,
+            })
 
         self.clip_model = clip_model
         self.logit_scale = clip_model.logit_scale
@@ -215,7 +219,7 @@ class CustomCLIP(nn.Module):
         # forward function for training
         # image: batch size x aug time x 3 x 224 x 224
         bs, aug_time, _, _, _ = image.shape
-        aug_time = 1
+        aug_time = 8
         image = image.reshape(-1, 3, 224, 224)
         # teacher model
         with torch.no_grad():
@@ -245,26 +249,18 @@ class CustomCLIP(nn.Module):
         text_features_tea = text_features_tea.reshape(bs, self.desc_per_batch, -1).mean(dim=1)
 
         # calc mu and log_std for pertubation
-        mu_visual = self.proj1_visual(image_features)
-        log_std_visual = self.proj2_visual(image_features)
-        mu_text = self.proj1_text(text_features)
-        log_std_text = self.proj2_text(text_features)
-
-        print(f"mu_visual: {mu_visual.mean()}, log_std_visual: {log_std_visual.mean()}")
+        mu_visual = self.emb1_visual(image_features)
+        log_std_visual = self.emb2_visual(image_features)
+        mu_text = self.emb1_text(text_features)
+        log_std_text = self.emb2_text(text_features)
 
         # augment features by pertubation
-        image_features = self.augment_features(image_features, mu_visual, log_std_visual, aug_time)
-        text_features = self.augment_features(text_features, mu_text, log_std_text, aug_time)
-        image_features_tea = self.augment_features(image_features_tea, mu_visual, log_std_visual, aug_time)
-        text_features_tea = self.augment_features(text_features_tea, mu_text, log_std_text, aug_time)
+        image_features_aug = self.augment_features(image_features, mu_visual, log_std_visual, aug_time)
+        text_features_aug = self.augment_features(text_features, mu_text, log_std_text, aug_time)
+        image_features_tea_aug = self.augment_features(image_features_tea, mu_visual, log_std_visual, aug_time)
+        text_features_tea_aug = self.augment_features(text_features_tea, mu_text, log_std_text, aug_time)
 
-        # (bs x aug_time) x (n_cls x self.desc_per_batch)
-        logits = self.logit_scale.exp() * image_features @ text_features.t()
-        #logits = logits.reshape(bs, aug_time, self.n_cls, self.desc_per_batch).permute(0, 1, 3, 2).contiguous()
-        logits = logits.reshape(bs, aug_time, self.n_cls, aug_time).permute(0, 1, 3, 2).contiguous()
-        wass_dist = Wasserstein_Distance(logits, self.logit_scale, True) # bs x n_cls
-
-        return wass_dist, image_features, text_features, image_features_tea, text_features_tea
+        return image_features_aug, text_features_aug, image_features_tea_aug, text_features_tea_aug, image_features, text_features
     
     @torch.no_grad()
     def get_text_features(self, ):
@@ -307,8 +303,16 @@ class AWT_PERTUBATION(TrainerX):
 
         print("Turning off gradients in both the image and the text encoder")
         for name, param in self.model.named_parameters():
-            if "adapter_learner" not in name:
+            if ("adapter_learner" not in name) and ("emb" not in name):
                 param.requires_grad_(False)
+
+        # Double check
+        # comment out because there are too many parameters
+        # enabled = set()
+        # for name, param in self.model.named_parameters():
+        #     if param.requires_grad:
+        #         enabled.add(name)
+        # print(f"Parameters to be updated: {enabled}")
 
         print("Trainable params:", sum(p.numel() for p in self.model.parameters() if p.requires_grad))
 
@@ -324,24 +328,39 @@ class AWT_PERTUBATION(TrainerX):
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-        output, img_feat_stu, text_feat_stu, img_feat_tea, text_feat_tea = self.model(image)
-        loss_ce = F.cross_entropy(output, label)
+        #img_feat_stu_aug, text_feat_stu, img_feat_tea, text_feat_tea,  = self.model(image)
+        img_feat_stu_aug, text_feat_stu_aug, img_feat_tea_aug, text_feat_tea_aug, img_feat_stu, text_feat_stu = self.model(image)
+
+        # image: batch size x aug time x 3 x 224 x 224
+        bs, aug_time, _, _, _ = image.shape
+        aug_time = 8
+        # (bs x aug_time) x (n_cls x self.desc_per_batch)
+        logits = self.model.logit_scale.exp() * img_feat_stu_aug @ text_feat_stu_aug.t()
+        logits = logits.reshape(bs, aug_time, self.model.n_cls, aug_time).permute(0, 1, 3, 2).contiguous()
+        wass_dist = Wasserstein_Distance(logits, self.model.logit_scale, True) # bs x n_cls
+
+        loss_ce = F.cross_entropy(wass_dist, label)
         # the distil coef may be tuned for different shots or datasets to achieve better results
         # we mainly choose from { (10.0, 25.0) (10.0, 10.0) (50.0, 50.0) }
-        loss_distil_img = F.l1_loss(img_feat_tea, img_feat_stu,
+        loss_distil_img = F.l1_loss(img_feat_tea_aug, img_feat_stu_aug,
                                       reduction='mean') * 10
-        loss_distil_text = F.l1_loss(text_feat_tea, text_feat_stu,
+        loss_distil_text = F.l1_loss(text_feat_tea_aug, text_feat_stu_aug,
                                       reduction='mean') * 25
-        loss = loss_distil_img + loss_distil_text + loss_ce
+        
+        loss_pertubation_img = F.l1_loss(img_feat_stu, img_feat_stu_aug.view(bs, aug_time, -1).mean(dim=1), 
+                                         reduction='mean') * 25
+        loss_pertubation_text = F.l1_loss(text_feat_stu, text_feat_stu_aug.view(bs, aug_time, -1).mean(dim=1),
+                                          reduction='mean') * 25
 
-        # loss function for pertubation modules
-        loss_pertubation = loss_ce
+        loss = loss_ce - loss_pertubation_img - loss_pertubation_text
 
         self.model_backward_and_update(loss, names="adapter_learners")
 
         loss_summary = {
-            "loss": loss.item(),
-            "acc": compute_accuracy(output, label)[0].item(),
+            "loss_ce": loss_ce.item(),
+            "loss_pertubation_img": loss_pertubation_img.item(),
+            "loss_pertubation_text": loss_pertubation_text.item(),
+            "acc": compute_accuracy(wass_dist, label)[0].item(),
         }
 
         if (self.batch_idx + 1) == self.num_batches:
