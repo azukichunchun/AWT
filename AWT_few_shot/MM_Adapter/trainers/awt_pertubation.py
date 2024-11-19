@@ -35,30 +35,6 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-class GaussPertubation(nn.Module):
-    def __init__(self, dim=512, aug_time=8):
-        super().__init__()
-        self.dim = dim
-        self.mean = nn.Parameter(torch.zeros(dim))
-        self.log_std = nn.Parameter(torch.zeros(dim))
-        self.aug_time = aug_time
-
-    def get_noise(self):
-        gauss_dist = torch.distributions.Normal(self.mean, self.log_std.exp())
-        e = gauss_dist.sample()
-        return F.softplus(e)
-
-    def augment(self, x):
-        aug_x = []
-        for i in range(self.aug_time):
-            noise = self.get_noise()
-            aug_x.extend(x + noise)
-        return torch.stack(aug_x)
-
-    def forward(self, x):
-        return self.augment(x)
-
-
 class Adapter(nn.Module):
     def __init__(self, d_model=None, scale=1.0, down_rate=8):
         super().__init__()
@@ -120,6 +96,40 @@ class Adapter_Learner(nn.Module):
             return self.adapt_mlp[layer_id](x)
 
 
+class Perturbation(nn.Module):
+    def __init__(self, dim=512, layer_id=[11], aug_time=8, dtype=torch.float16):
+        super().__init__()
+        self.dim = dim
+        self.aug_time = aug_time
+
+        self.emb1 = nn.Linear(dim, dim, dtype=dtype)
+        self.emb2 = nn.Linear(dim, dim, dtype=dtype)
+
+        self.layer_id = layer_id
+
+    def calc_mu_log_std(self, x):
+        mu = self.emb1(x)
+        log_std = self.emb2(x)
+        return mu, log_std
+
+    def forward(self, x, layer_id=None):
+
+        if not layer_id in self.layer_id:
+            return x
+
+        self.mu, self.log_std = self.calc_mu_log_std(x)
+        features_aug = []
+        for i in range(self.aug_time):
+            # sample eps from gauss distribution N(0, 1)
+            eps = torch.randn_like(self.mu)
+            e = self.mu + eps * self.log_std.exp()
+            #e = e / e.norm(dim=-1, keepdim=True)
+            h = x + F.softplus(e)
+            h = h / h.norm(dim=-1, keepdim=True)
+            features_aug.extend(h)
+        return torch.stack(features_aug)
+
+
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
@@ -144,21 +154,19 @@ class CustomCLIP(nn.Module):
         else:
             self.text_adapter_learner = None
 
-        ndim = clip_model.ln_final.weight.shape[0]
+        ndim_visual = clip_model.visual.ln_post.weight.shape[0]
+        ndim_text = clip_model.ln_final.weight.shape[0]
 
-        self.emb1_visual = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
-        self.emb2_visual = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
+        layer_id = [11]
 
-        self.emb1_text = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
-        self.emb2_text = nn.Linear(ndim, ndim, dtype=clip_model.dtype)
+        self.perturb_visual = Perturbation(ndim_visual, layer_id, 8, dtype=clip_model.dtype)
+        self.perturb_text = Perturbation(ndim_text, layer_id, 8, dtype=clip_model.dtype)
 
         self.adapter_learners = nn.ModuleDict({
                 "visual_adapter_learner": self.visual_adapter_learner,
                 "text_adapter_learner": self.text_adapter_learner,
-                "emb1_visual": self.emb1_visual,
-                "emb2_visual": self.emb2_visual,
-                "emb1_text": self.emb1_text,
-                "emb2_text": self.emb2_text,
+                "perturb_visual": self.perturb_visual,
+                "perturb_text": self.perturb_text,
             })
 
         self.clip_model = clip_model
@@ -169,7 +177,8 @@ class CustomCLIP(nn.Module):
         self.tot_desc = cfg.LLM.Num_desc + 1
         self.classnames = classnames
         self.texts = self.get_text_input(cfg) # n_cls x n_desc+1 x 77
-        
+
+
     @torch.no_grad()
     def get_text_input(self, cfg):
         dataset_name = Dataset_Name_Map[cfg.DATASET.NAME]
@@ -200,33 +209,20 @@ class CustomCLIP(nn.Module):
 
         return prompts.reshape(len(classnames), cfg.LLM.Num_desc+1, 77).cuda()
 
-    def augment_features(self, features, mu, log_std, aug_time=8):
-        # augment features by pertubation
-        features_aug = []
-        for i in range(aug_time):
-            # get pertubation noise by reparameterization trick
-            # sample eps from gauss distribution N(0, 1)
-            eps = torch.randn_like(mu)
-            e = mu + eps * log_std.exp()
-            #e = e / e.norm(dim=-1, keepdim=True)
-            h = features + F.softplus(e)
-            h = h / h.norm(dim=-1, keepdim=True)
-            features_aug.extend(h)
-
-        return torch.stack(features_aug)
 
     def forward(self, image):
         # forward function for training
         # image: batch size x aug time x 3 x 224 x 224
         bs, aug_time, _, _, _ = image.shape
         aug_time = 8
+        self.desc_per_batch = 1
         image = image.reshape(-1, 3, 224, 224)
-        # teacher model
-        with torch.no_grad():
-            image_features_tea = self.clip_model.encode_image(image)
-            image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
+        # # teacher model
+        # with torch.no_grad():
+        #     image_features_tea = self.clip_model.encode_image(image)
+        #     image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
         # student model
-        image_features = self.clip_model.encode_image(image, self.visual_adapter_learner)
+        image_features = self.clip_model.encode_image(image, self.visual_adapter_learner, self.perturb_visual)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         
         # sample sub-set texts for efficient training
@@ -235,12 +231,12 @@ class CustomCLIP(nn.Module):
                 self.texts[:, :1], self.texts[:, 1:][:, sample_idx]
             ], dim=1).reshape(-1, 77)
         
-        # teacher model
-        with torch.no_grad():
-            text_features_tea = self.clip_model.encode_text(sub_texts)
-            text_features_tea = text_features_tea / text_features_tea.norm(dim=-1, keepdim=True)
+        # # teacher model
+        # with torch.no_grad():
+        #     text_features_tea = self.clip_model.encode_text(sub_texts)
+        #     text_features_tea = text_features_tea / text_features_tea.norm(dim=-1, keepdim=True)
         # student model
-        text_features = self.clip_model.encode_text(sub_texts, self.text_adapter_learner)
+        text_features = self.clip_model.encode_text(sub_texts, self.text_adapter_learner, self.perturb_text)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
         # average text features for augments
@@ -255,18 +251,20 @@ class CustomCLIP(nn.Module):
         log_std_text = self.emb2_text(text_features)
 
         # augment features by pertubation
-        image_features_aug = self.augment_features(image_features, mu_visual, log_std_visual, aug_time)
-        text_features_aug = self.augment_features(text_features, mu_text, log_std_text, aug_time)
-        image_features_tea_aug = self.augment_features(image_features_tea, mu_visual, log_std_visual, aug_time)
-        text_features_tea_aug = self.augment_features(text_features_tea, mu_text, log_std_text, aug_time)
+        # image_features_aug = self.augment_features(image_features, mu_visual, log_std_visual, aug_time)
+        # text_features_aug = self.augment_features(text_features, mu_text, log_std_text, aug_time)
+        # image_features_tea_aug = self.augment_features(image_features_tea, mu_visual, log_std_visual, aug_time)
+        # text_features_tea_aug = self.augment_features(text_features_tea, mu_text, log_std_text, aug_time)
 
-        return image_features_aug, text_features_aug, image_features_tea_aug, text_features_tea_aug, image_features, text_features
+        return image_features_aug, text_features_aug, image_features, text_features
     
+
     @torch.no_grad()
     def get_text_features(self, ):
         text_features = self.clip_model.encode_text(self.texts.reshape(-1, 77), self.text_adapter_learner)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         return text_features
+
 
     @torch.no_grad()
     def inference(self, image, text_features):
@@ -329,7 +327,7 @@ class AWT_PERTUBATION(TrainerX):
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
         #img_feat_stu_aug, text_feat_stu, img_feat_tea, text_feat_tea,  = self.model(image)
-        img_feat_stu_aug, text_feat_stu_aug, img_feat_tea_aug, text_feat_tea_aug, img_feat_stu, text_feat_stu = self.model(image)
+        img_feat_stu_aug, text_feat_stu_aug, img_feat_stu, text_feat_stu = self.model(image)
 
         # image: batch size x aug time x 3 x 224 x 224
         bs, aug_time, _, _, _ = image.shape
@@ -342,10 +340,10 @@ class AWT_PERTUBATION(TrainerX):
         loss_ce = F.cross_entropy(wass_dist, label)
         # the distil coef may be tuned for different shots or datasets to achieve better results
         # we mainly choose from { (10.0, 25.0) (10.0, 10.0) (50.0, 50.0) }
-        loss_distil_img = F.l1_loss(img_feat_tea_aug, img_feat_stu_aug,
-                                      reduction='mean') * 10
-        loss_distil_text = F.l1_loss(text_feat_tea_aug, text_feat_stu_aug,
-                                      reduction='mean') * 25
+        # loss_distil_img = F.l1_loss(img_feat_tea_aug, img_feat_stu_aug,
+        #                               reduction='mean') * 10
+        # loss_distil_text = F.l1_loss(text_feat_tea_aug, text_feat_stu_aug,
+        #                               reduction='mean') * 25
         
         loss_pertubation_img = F.l1_loss(img_feat_stu, img_feat_stu_aug.view(bs, aug_time, -1).mean(dim=1), 
                                          reduction='mean') * 25

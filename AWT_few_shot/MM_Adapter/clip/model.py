@@ -188,8 +188,8 @@ class ResidualAttentionBlock(nn.Module):
             attn_mask = attn_mask[:text_len, :text_len]
         return self.attn(x, x, x, need_weights=False, attn_mask=attn_mask)[0]
 
-    def forward(self, x_with_adapter):
-        x, adapter = x_with_adapter
+    def forward(self, x_with_adapter_and_perturb):
+        x, adapter, perturb = x_with_adapter_and_perturb
 
         if adapter is None:
             x = x + self.attention(self.ln_1(x))
@@ -208,7 +208,15 @@ class ResidualAttentionBlock(nn.Module):
                 pos = 'mlp'
             )
 
-        return x, adapter
+        if perturb is not None:            
+            x = x.permute(1, 0, 2)
+            x = perturb(
+                x,
+                self.layer_id
+            )
+            x = x.permute(1, 0, 2)
+
+        return x, adapter, perturb
 
 
 class Transformer(nn.Module):
@@ -218,8 +226,8 @@ class Transformer(nn.Module):
         self.layers = layers
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, i, attn_mask) for i in range(layers)])
 
-    def forward(self, x: torch.Tensor, adapter=None):
-        x, _ = self.resblocks((x, adapter))
+    def forward(self, x: torch.Tensor, adapter=None, perturb=None):
+        x, _, _ = self.resblocks(tuple([x, adapter, perturb]))
         return x
 
 
@@ -240,7 +248,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, adapter=None):
+    def forward(self, x: torch.Tensor, adapter=None, perturb=None):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -249,7 +257,7 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x, adapter)
+        x = self.transformer(x, adapter, perturb)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
@@ -357,16 +365,16 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, adapter=None):
-        return self.visual(image.type(self.dtype), adapter)
+    def encode_image(self, image, adapter=None, perturb=None):
+        return self.visual(image.type(self.dtype), adapter, perturb)
 
-    def encode_text(self, text, adapter=None):
+    def encode_text(self, text, adapter=None, perturb=None):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x[:, :min(x.shape[1], text.argmax(dim=-1).max()+1)]
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x, adapter)
+        x = self.transformer(x, adapter, perturb)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
