@@ -217,13 +217,13 @@ class CustomCLIP(nn.Module):
         aug_time = 8
         self.desc_per_batch = 1
         image = image.reshape(-1, 3, 224, 224)
-        # # teacher model
-        # with torch.no_grad():
-        #     image_features_tea = self.clip_model.encode_image(image)
-        #     image_features_tea = image_features_tea / image_features_tea.norm(dim=-1, keepdim=True)
+        # teacher model
+        with torch.no_grad():
+            image_features = self.clip_model.encode_image(image)
+            image_featuresa = image_features / image_features.norm(dim=-1, keepdim=True)
         # student model
-        image_features = self.clip_model.encode_image(image, self.visual_adapter_learner, self.perturb_visual)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+        image_features_aug = self.clip_model.encode_image(image, self.visual_adapter_learner, self.perturb_visual)
+        image_features_aug = image_features_aug / image_features_aug.norm(dim=-1, keepdim=True)
         
         # sample sub-set texts for efficient training
         sample_idx = torch.randperm(self.texts.size(1)-1)[:self.desc_per_batch-1]
@@ -231,33 +231,16 @@ class CustomCLIP(nn.Module):
                 self.texts[:, :1], self.texts[:, 1:][:, sample_idx]
             ], dim=1).reshape(-1, 77)
         
-        # # teacher model
-        # with torch.no_grad():
-        #     text_features_tea = self.clip_model.encode_text(sub_texts)
-        #     text_features_tea = text_features_tea / text_features_tea.norm(dim=-1, keepdim=True)
+        # teacher model
+        with torch.no_grad():
+            text_features = self.clip_model.encode_text(sub_texts)
+            text_features = text_features / text_features.norm(dim=-1, keepdim=True)
         # student model
-        text_features = self.clip_model.encode_text(sub_texts, self.text_adapter_learner, self.perturb_text)
-        text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        text_features_aug = self.clip_model.encode_text(sub_texts, self.text_adapter_learner, self.perturb_text)
+        text_features_aug = text_features_aug / text_features_aug.norm(dim=-1, keepdim=True)
 
-        # average text features for augments
-        assert text_features.size(0) == bs * self.desc_per_batch
-        text_features = text_features.reshape(bs, self.desc_per_batch, -1).mean(dim=1)
-        text_features_tea = text_features_tea.reshape(bs, self.desc_per_batch, -1).mean(dim=1)
+        return image_features_aug, text_features_aug, image_featuresa, text_features
 
-        # calc mu and log_std for pertubation
-        mu_visual = self.emb1_visual(image_features)
-        log_std_visual = self.emb2_visual(image_features)
-        mu_text = self.emb1_text(text_features)
-        log_std_text = self.emb2_text(text_features)
-
-        # augment features by pertubation
-        # image_features_aug = self.augment_features(image_features, mu_visual, log_std_visual, aug_time)
-        # text_features_aug = self.augment_features(text_features, mu_text, log_std_text, aug_time)
-        # image_features_tea_aug = self.augment_features(image_features_tea, mu_visual, log_std_visual, aug_time)
-        # text_features_tea_aug = self.augment_features(text_features_tea, mu_text, log_std_text, aug_time)
-
-        return image_features_aug, text_features_aug, image_features, text_features
-    
 
     @torch.no_grad()
     def get_text_features(self, ):
@@ -326,14 +309,13 @@ class AWT_PERTUBATION(TrainerX):
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
-        #img_feat_stu_aug, text_feat_stu, img_feat_tea, text_feat_tea,  = self.model(image)
-        img_feat_stu_aug, text_feat_stu_aug, img_feat_stu, text_feat_stu = self.model(image)
+        image_features_aug, text_features_aug, image_features, text_features = self.model(image)
 
         # image: batch size x aug time x 3 x 224 x 224
         bs, aug_time, _, _, _ = image.shape
         aug_time = 8
         # (bs x aug_time) x (n_cls x self.desc_per_batch)
-        logits = self.model.logit_scale.exp() * img_feat_stu_aug @ text_feat_stu_aug.t()
+        logits = self.model.logit_scale.exp() * image_features_aug @ text_features_aug.t()
         logits = logits.reshape(bs, aug_time, self.model.n_cls, aug_time).permute(0, 1, 3, 2).contiguous()
         wass_dist = Wasserstein_Distance(logits, self.model.logit_scale, True) # bs x n_cls
 
@@ -345,9 +327,9 @@ class AWT_PERTUBATION(TrainerX):
         # loss_distil_text = F.l1_loss(text_feat_tea_aug, text_feat_stu_aug,
         #                               reduction='mean') * 25
         
-        loss_pertubation_img = F.l1_loss(img_feat_stu, img_feat_stu_aug.view(bs, aug_time, -1).mean(dim=1), 
+        loss_pertubation_img = F.l1_loss(image_features, image_features_aug.view(bs, aug_time, -1).mean(dim=1), 
                                          reduction='mean') * 25
-        loss_pertubation_text = F.l1_loss(text_feat_stu, text_feat_stu_aug.view(bs, aug_time, -1).mean(dim=1),
+        loss_pertubation_text = F.l1_loss(text_features, text_features_aug.view(bs, aug_time, -1).mean(dim=1),
                                           reduction='mean') * 25
 
         loss = loss_ce - loss_pertubation_img - loss_pertubation_text

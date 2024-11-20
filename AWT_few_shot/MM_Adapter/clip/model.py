@@ -191,10 +191,10 @@ class ResidualAttentionBlock(nn.Module):
     def forward(self, x_with_adapter_and_perturb):
         x, adapter, perturb = x_with_adapter_and_perturb
 
-        if adapter is None:
+        if adapter is None and perturb is None:
             x = x + self.attention(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
-            return x, None
+            return x, None, None
         else:
             x = x + adapter(
                 self.attention(self.ln_1(x)),
@@ -208,7 +208,6 @@ class ResidualAttentionBlock(nn.Module):
                 pos = 'mlp'
             )
 
-        if perturb is not None:            
             x = x.permute(1, 0, 2)
             x = perturb(
                 x,
@@ -216,7 +215,7 @@ class ResidualAttentionBlock(nn.Module):
             )
             x = x.permute(1, 0, 2)
 
-        return x, adapter, perturb
+            return x, adapter, perturb
 
 
 class Transformer(nn.Module):
@@ -227,7 +226,7 @@ class Transformer(nn.Module):
         self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, i, attn_mask) for i in range(layers)])
 
     def forward(self, x: torch.Tensor, adapter=None, perturb=None):
-        x, _, _ = self.resblocks(tuple([x, adapter, perturb]))
+        x, _, _ = self.resblocks((x, adapter, perturb))
         return x
 
 
@@ -377,6 +376,9 @@ class CLIP(nn.Module):
         x = self.transformer(x, adapter, perturb)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
+
+        if not perturb is None:
+            text = text.repeat_interleave(repeats=perturb.aug_time, dim=0)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
         # take features from the eot embedding (eot_token is the highest number in each sequence)
