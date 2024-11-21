@@ -56,7 +56,7 @@ class Adapter(nn.Module):
     def _init_param(self):
         with torch.no_grad():
             nn.init.xavier_uniform_(self.down_proj.weight)
-            nn.init.zeros_(self.up_proj.weight)
+            nn.init.xavier_uniform_(self.up_proj.weight)
             nn.init.zeros_(self.down_proj.bias)
             nn.init.zeros_(self.up_proj.bias)
 
@@ -118,14 +118,19 @@ class Perturbation(nn.Module):
             return x
 
         self.mu, self.log_std = self.calc_mu_log_std(x)
+        self.std = torch.exp(0.5 * self.log_std)
+
+        self.std = torch.clamp(self.std, 0, 1)
+        self.mu = torch.clamp(self.mu, -2, 2)
+
         features_aug = []
         for i in range(self.aug_time):
             # sample eps from gauss distribution N(0, 1)
             eps = torch.randn_like(self.mu)
-            e = self.mu + eps * self.log_std.exp()
+            e = self.mu + eps * self.std
             #e = e / e.norm(dim=-1, keepdim=True)
             h = x + F.softplus(e)
-            h = h / h.norm(dim=-1, keepdim=True)
+            #h = h / h.norm(dim=-1, keepdim=True)
             features_aug.extend(h)
         return torch.stack(features_aug)
 
@@ -220,7 +225,7 @@ class CustomCLIP(nn.Module):
         # teacher model
         with torch.no_grad():
             image_features = self.clip_model.encode_image(image)
-            image_featuresa = image_features / image_features.norm(dim=-1, keepdim=True)
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
         # student model
         image_features_aug = self.clip_model.encode_image(image, self.visual_adapter_learner, self.perturb_visual)
         image_features_aug = image_features_aug / image_features_aug.norm(dim=-1, keepdim=True)
@@ -239,7 +244,8 @@ class CustomCLIP(nn.Module):
         text_features_aug = self.clip_model.encode_text(sub_texts, self.text_adapter_learner, self.perturb_text)
         text_features_aug = text_features_aug / text_features_aug.norm(dim=-1, keepdim=True)
 
-        return image_features_aug, text_features_aug, image_featuresa, text_features
+
+        return image_features_aug, text_features_aug, image_features, text_features
 
 
     @torch.no_grad()
@@ -284,7 +290,7 @@ class AWT_PERTUBATION(TrainerX):
 
         print("Turning off gradients in both the image and the text encoder")
         for name, param in self.model.named_parameters():
-            if ("adapter_learner" not in name) and ("emb" not in name):
+            if "adapter_learner" not in name:
                 param.requires_grad_(False)
 
         # Double check
@@ -320,17 +326,11 @@ class AWT_PERTUBATION(TrainerX):
         wass_dist = Wasserstein_Distance(logits, self.model.logit_scale, True) # bs x n_cls
 
         loss_ce = F.cross_entropy(wass_dist, label)
-        # the distil coef may be tuned for different shots or datasets to achieve better results
-        # we mainly choose from { (10.0, 25.0) (10.0, 10.0) (50.0, 50.0) }
-        # loss_distil_img = F.l1_loss(img_feat_tea_aug, img_feat_stu_aug,
-        #                               reduction='mean') * 10
-        # loss_distil_text = F.l1_loss(text_feat_tea_aug, text_feat_stu_aug,
-        #                               reduction='mean') * 25
         
         loss_pertubation_img = F.l1_loss(image_features, image_features_aug.view(bs, aug_time, -1).mean(dim=1), 
-                                         reduction='mean') * 25
+                                         reduction='mean')
         loss_pertubation_text = F.l1_loss(text_features, text_features_aug.view(bs, aug_time, -1).mean(dim=1),
-                                          reduction='mean') * 25
+                                          reduction='mean')
 
         loss = loss_ce - loss_pertubation_img - loss_pertubation_text
 

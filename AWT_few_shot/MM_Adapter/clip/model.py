@@ -195,6 +195,18 @@ class ResidualAttentionBlock(nn.Module):
             x = x + self.attention(self.ln_1(x))
             x = x + self.mlp(self.ln_2(x))
             return x, None, None
+        elif adapter is not None and perturb is None:
+            x = x + adapter(
+                self.attention(self.ln_1(x)),
+                self.layer_id,
+                pos = 'attn'
+            )
+            x = x + adapter(
+                self.mlp(self.ln_2(x)),
+                self.layer_id,
+                pos = 'mlp'
+            )
+            return x, adapter, None
         else:
             x = x + adapter(
                 self.attention(self.ln_1(x)),
@@ -377,7 +389,7 @@ class CLIP(nn.Module):
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
-        if not perturb is None:
+        if perturb is not None:
             text = text.repeat_interleave(repeats=perturb.aug_time, dim=0)
 
         # x.shape = [batch_size, n_ctx, transformer.width]
