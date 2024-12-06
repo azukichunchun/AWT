@@ -28,7 +28,7 @@ import trainers.cocoop
 import trainers.zsclip
 import trainers.awt_mixup
 import trainers.awt_pertubation
-
+import trainers.awt_resample
 
 def print_args(args, cfg):
     print("***************")

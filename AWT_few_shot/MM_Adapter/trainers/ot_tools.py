@@ -32,8 +32,8 @@ def Sinkhorn(K, u, v):
     thresh = 1e-2
     for i in range(100):
         r0 = r
-        r = u / torch.matmul(K, c.unsqueeze(-1)).squeeze(-1)
-        c = v / torch.matmul(K.permute(0, 2, 1).contiguous(), r.unsqueeze(-1)).squeeze(-1)
+        r = u / torch.matmul(K, c.unsqueeze(-1)).squeeze(-1) # weigh r by image weights
+        c = v / torch.matmul(K.permute(0, 2, 1).contiguous(), r.unsqueeze(-1)).squeeze(-1) # weigh c by text weights
         err = (r - r0).abs().mean()
         if err.item() < thresh:
             break
@@ -47,14 +47,14 @@ def optimal_transport(logits, logit_scale, image_weights, text_weights):
     sim = logits / logit_scale.exp()
     sim = sim.permute(0, 3, 1, 2).reshape(bs*n_cls, aug_time, n_des) # (bs*n_cls) x aug_time x n_des
     
-    wdist = 1.0 - sim
+    wdist = 1.0 - sim # change similarity to cost
     with torch.no_grad():
         KK = torch.exp(-wdist / eps)
         T = Sinkhorn(KK, image_weights, text_weights)
-        T = T.reshape(bs, n_cls, aug_time, n_des).permute(0, 2, 3, 1)
+        T = T.reshape(bs, n_cls, aug_time, n_des).permute(0, 2, 3, 1) # bs x aug_time x n_des x n_cls
     assert not torch.isnan(T).any()
 
-    wass_dist = torch.sum(T * logits, dim=(1, 2))
+    wass_dist = torch.sum(T * logits, dim=(1, 2)) # bs x n_cls
 
     return wass_dist
 
