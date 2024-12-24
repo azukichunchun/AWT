@@ -55,7 +55,6 @@ def optimal_transport(logits, logit_scale, image_weights, text_weights):
     assert not torch.isnan(T).any()
 
     wass_dist = torch.sum(T * logits, dim=(1, 2)) # bs x n_cls
-
     return wass_dist
 
 def Wasserstein_Distance(logits, logit_scale, is_train):
