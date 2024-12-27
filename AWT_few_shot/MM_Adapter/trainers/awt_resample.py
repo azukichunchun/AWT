@@ -108,11 +108,6 @@ class GaussianProjector(nn.Module):
             nn.GELU(),
             nn.Linear(n_dim * 2 * self.num_classes, n_dim * 2 * self.num_classes)
         ).half()
-        # self.vae_encoder = nn.Sequential(
-        #     nn.Linear(n_dim, latent_dim),
-        #     nn.GELU(),
-        #     nn.Linear(latent_dim, n_dim * 2)
-        # ).half()
 
         self._init_param()
     
@@ -264,11 +259,6 @@ class CustomCLIP(nn.Module):
         text_features = self.clip_model.encode_text(sub_texts, self.text_adapter_learner) # (n_cls x desc_per_batch) x 512
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        # # (bs x aug_time) x (n_cls x self.desc_per_batch)
-        # logits = self.logit_scale.exp() * image_features @ text_features.t()
-        # logits = logits.reshape(bs, aug_time, self.n_cls, self.desc_per_batch).permute(0, 1, 3, 2).contiguous()
-        # wass_dist = Wasserstein_Distance(logits, self.logit_scale, True) # bs x n_cls
-
         return image_features, text_features
     
     def vae(self, image_features, text_features, label):
@@ -284,170 +274,53 @@ class CustomCLIP(nn.Module):
         # create text label. (n_cls x desc_per_batch) x 1
         label_text = torch.arange(self.n_cls).unsqueeze(1).repeat(1, self.desc_per_batch).reshape(-1).to(label.device)
 
-        image_features_z, mean_visual, logvar_visual, kl_loss_img = self.noise_modulator_visual(image_features, label_image)
-        text_features_z, mean_text, logvar_text, kl_loss_text = self.noise_modulator_text(text_features, label_text)
+        image_features_z, _, _, kl_loss_img = self.noise_modulator_visual(image_features, label_image)
+        text_features_z, _, _, kl_loss_text = self.noise_modulator_text(text_features, label_text)
+
+        image_features_z = image_features_z.view(bs, aug_time, -1) # bs x aug_time x 512
+        text_features_z = text_features_z.view(self.n_cls, self.desc_per_batch, -1) # n_cls x desc_per_batch x 512
+
+        mean_visual = image_features_z.mean(dim=1) # bs x 512
+        mean_text = text_features_z.mean(dim=1) # n_cls x 512
+
+        # centering
+        image_features_center = image_features_z - mean_visual.unsqueeze(1) # bs x aug_time x 512
+        text_features_center = text_features_z - mean_text.unsqueeze(1)
+
+        # calculate covariance matrix (divide by (B-1) for Beesel correction)
+        cov_visual = (image_features_center.transpose(1, 2) @ image_features_center) / (aug_time - 1) # bs x 512 x 512
+        cov_text = (text_features_center.transpose(1, 2) @ text_features_center) / (self.desc_per_batch - 1) # n_cls x 512 x 512
 
         wass_loss = 0
-        for i in label.unique():
-            mean_visual_i = mean_visual[label_image == i].mean(dim=0)
-            mean_text_i = mean_text[label_text == i].mean(dim=0)
+        for i, l in enumerate(label):
+            m1 = mean_visual[i]
+            m2 = mean_text[l]
 
-            logvar_visual_i = logvar_visual[label_image == i].mean(dim=0)
-            logvar_text_i = logvar_text[label_text == i].mean(dim=0)
+            C1 = cov_visual[i].to(torch.float32)
+            C2 = cov_text[l].to(torch.float32)
 
-            var_visual_i = torch.exp(logvar_visual_i)
-            var_text_i = torch.exp(logvar_text_i)
+            # calculate 2-Wasserstein distance
+            diff_mean_sq = torch.sum((m1 - m2).pow(2))
 
-            mean_diff = (mean_visual_i - mean_text_i).pow(2).sum(dim=-1)
-            var_diff = (var_visual_i.sqrt() - var_text_i.sqrt()).pow(2).sum(dim=-1)
+            e2, U2 = torch.linalg.eigh(C2)
+            e2_sqrt = torch.sqrt(torch.clamp(e2, min=1e-7))
+            C2_half = (U2 * e2_sqrt.unsqueeze(0)) @ U2.T
 
-            w2 = mean_diff + var_diff
+            temp = C2_half @ C1 @ C2_half
+            e_temp, U_temp = torch.linalg.eigh(temp)
+            e_temp_sqrt = torch.sqrt(torch.clamp(e_temp, min=1e-7))
+            trace_term = torch.sum(e_temp_sqrt)
 
-            wass_loss += w2
+            trace_c1_c2 = torch.trace(C1) + torch.trace(C2)
 
+            wass_loss += diff_mean_sq + trace_c1_c2 - 2.0 * trace_term
+        
         wass_loss = wass_loss.mean()
 
+        image_features_z = image_features_z.view(bs*aug_time, -1)
+        text_features_z = text_features_z.view(self.n_cls*self.desc_per_batch, -1)
+
         return image_features_z, text_features_z, kl_loss_img, kl_loss_text, wass_loss
-
-
-    def contrastive(self, image_features, text_features, label, margin=0.1):
-        # image_feature: (bs x aug_time) x 512
-        # text_feature: (n_cls x desc_per_batch) x 512
-        # label: bs x 1
-
-        bs = label.size(0)
-        aug_time = image_features.size(0) // bs
-
-        # pairwise cosine similarity
-        similarity_matrix = torch.mm(image_features, text_features.T)  # (bs * aug_time) x (n_cls * desc_per_batch)
-
-        # label: bs x 1 -> (bs x aug_time) x 1
-        # text_labels: (n_cls * desc_per_batch) x 1        
-        label_image = label.unsqueeze(1).repeat(1, aug_time).reshape(-1).to(label.device)
-        label_text = torch.arange(self.n_cls).unsqueeze(1).repeat(1, self.desc_per_batch).reshape(-1).to(label.device)
-        
-        positive_mask = (label_image.unsqueeze(1) == label_text.unsqueeze(0)).float()
-        positive_loss = -similarity_matrix * positive_mask  # positive: high similarity
-        positive_loss = positive_loss.sum() / positive_mask.sum()
-
-        negative_mask = 1 - positive_mask  
-        negative_loss = F.relu(similarity_matrix - margin) * negative_mask  # negative: low similarity
-        negative_loss = negative_loss.sum() / negative_mask.sum()
-
-        # total loss
-        return positive_loss + negative_loss
-
-    def w2(self, image_features, text_features, label):
-
-        bs = label.size(0)
-        aug_time = image_features.size(0) // bs
-
-        label_image = label.unsqueeze(1).repeat(1, aug_time).reshape(-1).to(label.device)
-        label_text = torch.arange(self.n_cls).unsqueeze(1).repeat(1, self.desc_per_batch).reshape(-1).to(label.device)
-        
-        # calculate kl divergence b/w image and text features of the same class
-        w2 = 0
-        for i in label.unique():
-            image_features_i = image_features[label_image == i]
-            text_features_i = text_features[label_text == i]
-
-            mu_p = torch.mean(image_features_i, dim=0)
-            logvar_p = torch.var(image_features_i, dim=0, unbiased=False)
-            var_p = torch.exp(logvar_p)
-
-            mu_q = torch.mean(text_features_i, dim=0)
-            lovar_q = torch.var(text_features_i, dim=0, unbiased=False)
-            var_q = torch.exp(lovar_q)
-
-            mean_diff = (mu_p - mu_q).pow(2).sum(dim=-1)
-            var_diff = (var_p.sqrt() - var_q.sqrt()).pow(2).sum(dim=-1)
-            
-            w2 += (mean_diff + var_diff).sqrt()
-        
-        w2 = w2.mean()
-
-        return w2
-
-    
-    def wasserstein_distance(self, image_features, text_features, label, epsilon=0.1, n_iter=100, threshold=1e-2):
-        bs = label.size(0)
-        aug_time = image_features.size(0) // bs
-        n_desc = self.desc_per_batch
-        n_cls = self.n_cls
-
-        sim = image_features @ text_features.T
-        sim = sim.reshape(bs, aug_time, n_cls, n_desc).permute(0, 3, 1, 2).reshape(bs*n_cls, aug_time, n_desc)
-        wdist = 1.0 - sim
-
-        # label: bs x 1 -> (bs x aug_time) x 1
-        # text_labels: (n_cls * desc_per_batch) x 1
-        label_image = label.unsqueeze(1).repeat(1, aug_time).reshape(-1).to(label.device)
-        label_text = torch.arange(self.n_cls).unsqueeze(1).repeat(1, self.desc_per_batch).reshape(-1).to(label.device)
-        mask = (label_image.unsqueeze(1) == label_text.unsqueeze(0)).half()
-        
-        with torch.no_grad():
-            K = torch.exp(-wdist / epsilon).half()# * mask
-            u = torch.ones((bs*n_cls, aug_time), device=sim.device).half() / aug_time
-            v = torch.ones((bs*n_cls, n_desc), device=sim.device).half() / n_desc
-
-            r = torch.ones_like(u).half()
-            c = torch.ones_like(v).half()
-
-            for _ in range(n_iter):
-                r0 = r
-                r = u / torch.matmul(K, v.unsqueeze(-1)).squeeze(-1)
-                c = v / torch.matmul(K.permute(0, 2, 1).contiguous(), u.unsqueeze(-1)).squeeze(-1)
-                err = (r - r0).abs().mean()
-                if err.item() < threshold:
-                    break
-
-        # Sinkhorn distance
-        # transport_plan = torch.matmul(u.unsqueeze(1), v.unsqueeze(0)) * K
-        # sinkhorn_distance = torch.sum(transport_plan * cost)
-        T = torch.matmul(r.unsqueeze(-1), c.unsqueeze(-2)) * K
-        T = T.reshape(bs, n_cls, aug_time, n_desc).permute(0, 2, 3, 1)
-        assert not torch.isnan(T).any()
-        wass_dist = torch.sum(T, dim=(1, 2))
-
-        return wass_dist
-
-    def Sinkhorn(self, K, u, v):
-        r = torch.ones_like(u)
-        c = torch.ones_like(v)
-        thresh = 1e-2
-        for i in range(100):
-            r0 = r
-            r = u / torch.matmul(K, c.unsqueeze(-1)).squeeze(-1) # weigh r by image weights
-            c = v / torch.matmul(K.permute(0, 2, 1).contiguous(), r.unsqueeze(-1)).squeeze(-1) # weigh c by text weights
-            err = (r - r0).abs().mean()
-            if err.item() < thresh:
-                break
-        T = torch.matmul(r.unsqueeze(-1), c.unsqueeze(-2)) * K
-        return T
-
-    def optimal_transport(self, logits, logit_scale, label):
-        # logits: bs x aug_time x n_des x n_cls
-        bs, aug_time, n_des, n_cls = logits.shape
-
-        label_image = label.unsqueeze(1).repeat(1, aug_time).reshape(-1).to(label.device)
-        label_text = torch.arange(n_cls).unsqueeze(1).repeat(1, n_des).reshape(-1).to(label.device)
-        mask = (label_image.unsqueeze(1) == label_text.unsqueeze(0)).half()
-        mask = mask.reshape(bs, aug_time, n_des, n_cls).permute(0, 1, 3, 2).reshape(bs, aug_time, n_cls, n_des)
-
-        eps = 1
-        sim = logits / logit_scale.exp()
-        sim = sim.permute(0, 3, 1, 2).reshape(bs*n_cls, aug_time, n_des) # (bs*n_cls) x aug_time x n_des
-        image_weights = torch.ones((bs*n_cls, aug_time)).to(sim.device).half()
-        text_weights = torch.ones((bs*n_cls, n_des)).to(sim.device).half()
-        wdist = 1.0 - sim # change similarity to cost
-        with torch.no_grad():
-            KK = torch.exp(-wdist / eps)
-            T = self.Sinkhorn(KK, image_weights, text_weights)
-            T = T.reshape(bs, n_cls, aug_time, n_des).permute(0, 2, 3, 1) # bs x aug_time x n_des x n_cls
-        assert not torch.isnan(T).any()
-        import pdb; pdb.set_trace()
-        wass_dist = torch.sum(T * logits, dim=(1, 2)) # bs x n_cls
-        return wass_dist
 
     @torch.no_grad()
     def get_text_features(self, ):
@@ -467,7 +340,7 @@ class CustomCLIP(nn.Module):
         return text_features_z
 
     @torch.no_grad()
-    def inference_(self, image, text_features):
+    def inference(self, image, text_features):
         # forward function for testing
         # image: batch size x aug time x 3 x 224 x 224
         bs, aug_time, _, _, _ = image.shape
@@ -483,7 +356,7 @@ class CustomCLIP(nn.Module):
         return wass_dist
 
     @torch.no_grad()
-    def inference(self, image, text_features_z):
+    def inference_(self, image, text_features_z):
         bs, aug_time, _, _, _ = image.shape
         image = image.reshape(-1, 3, 224, 224)
         image_features = self.clip_model.encode_image(image, self.visual_adapter_learner)
@@ -540,43 +413,37 @@ class AWT_RESAMPLE(TrainerX):
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
 
-        temperture = 100
-
         bs, aug_time, _, _, _ = image.shape
 
         image_features, text_features = self.model(image)
-        logits = self.model.logit_scale.exp() * image_features @ text_features.t()
-        logits = logits.reshape(bs, aug_time, self.model.n_cls, self.model.desc_per_batch).permute(0, 1, 3, 2).contiguous()
-        wass_dist = self.model.optimal_transport(logits, self.model.logit_scale, label)
-        #sinkhorn_distance = self.model.wasserstein_distance(image_features, text_features, label)
-        output = torch.cdist(image_features, text_features) # (bs x aug_time) x (desc_per_batch x n_cls)
-        output = output.reshape(bs, aug_time, self.model.desc_per_batch, self.model.n_cls).mean(dim=(1, 2)) # bs x n_cls
-        output = -output / temperture
+        image_features_z, text_features_z, kl_loss_img, kl_loss_text, wass_loss = self.model.vae(image_features, text_features, label)
 
-        # image_features_z, text_features_z, kl_loss_img, kl_loss_text, wass_loss = self.model.vae(image_features, text_features, label)
-        # output = torch.cdist(image_features_z, text_features_z) # (bs x aug_time) x (desc_per_batch x n_cls)
-        # output = output.reshape(bs, aug_time, self.model.desc_per_batch, self.model.n_cls).mean(dim=(1, 2)) # bs x n_cls
-        # output = -output / temperture
-        import pdb; pdb.set_trace()
+        # logits = self.model.logit_scale.exp() * image_features @ text_features.t()
+        # logits = logits.reshape(bs, aug_time, self.model.n_cls, self.model.desc_per_batch).permute(0, 1, 3, 2).contiguous()
+        # output = Wasserstein_Distance(logits, self.model.logit_scale, True) # bs x n_cls
+        #import pdb; pdb.set_trace()
+        output = torch.cdist(image_features_z, text_features_z) # (bs x aug_time) x (desc_per_batch x n_cls)
+        output = output.reshape(bs, aug_time, self.model.n_cls, self.model.desc_per_batch)
+        
+        output = output.min(dim=1)[0]
+        output = output.min(dim=-1)[0] # [1, bs x n_cls]
+        output = output.reshape(bs, self.model.n_cls) # # bs x n_cls
+        output = -output
+
         loss_ce = F.cross_entropy(output, label)
-
-        loss = loss_ce
-        #loss = wass_loss + kl_loss_img + kl_loss_text + loss_ce
-
+        wass_loss = wass_loss * 0.0001
+        kl_loss_img = kl_loss_img * 0.1
+        kl_loss_text = kl_loss_text * 0.1
+        
+        #loss = loss_ce
+        loss = kl_loss_img + kl_loss_text + loss_ce + wass_loss
         self.model_backward_and_update(loss)
-
-        # # パラメータの勾配を確認
-        # for name, param in self.model.named_parameters():
-        #     if param.requires_grad:
-        #         if "noise_modulator" in name:
-        #             print(f"{name} grad: {param.grad.norm().item()}")
-        #             print(f"{name} change: {(param - initial_params[name]).norm().item()}")
 
         loss_summary = {
             "loss_ce": loss_ce.item(),
-            #"kl_loss_img": kl_loss_img.item(),
-            #"kl_loss_text": kl_loss_text.item(),
-            "wass_loss": wass_dist.item(),
+            "kl_loss_img": kl_loss_img.item(),
+            "kl_loss_text": kl_loss_text.item(),
+            "wass_loss": wass_loss.item(),
             "loss": loss.item(),
             "acc": compute_accuracy(output, label)[0].item(),
         }
