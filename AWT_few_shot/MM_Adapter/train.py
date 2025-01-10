@@ -117,6 +117,11 @@ def extend_cfg(cfg):
     cfg.LLM.Num_desc = 10
     cfg.LLM.Desc_Per_Batch = 4
 
+    cfg.OPTIM_PROJ = CN()
+    cfg.OPTIM_PROJ = cfg.OPTIM.clone()
+    cfg.OPTIM_PROJ.NAME = "adam"
+    cfg.OPTIM_PROJ.LR = 1e-3
+    cfg.OPTIM_PROJ.WEIGHT_DECAY = 0.0
 
 def setup_cfg(args):
     cfg = get_cfg_default()

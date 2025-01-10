@@ -14,7 +14,7 @@ from dassl.optim import build_optimizer, build_lr_scheduler
 
 from clip import clip
 from datasets.cls_to_names import CUSTOM_TEMPLATES, Dataset_Name_Map, get_classnames
-from .ot_tools import Wasserstein_Distance
+from .ot_tools_2 import Wasserstein_Distance
 
 import os
 import pickle
@@ -37,67 +37,6 @@ def load_clip_to_cpu(cfg):
     return model
 
 
-class Adapter(nn.Module):
-    def __init__(self, d_model=None, scale=1.0, down_rate=8):
-        super().__init__()
-
-        self.scale = scale
-        if scale == -1.0:
-            # learnable scale
-            self.scale = nn.Parameter(torch.ones(1, dtype=torch.float16), requires_grad=True)
-        
-        self.down_proj = nn.Linear(d_model, d_model // down_rate)
-        self.non_linear_func = nn.GELU()
-        self.up_proj = nn.Linear(d_model // down_rate, d_model)
-
-        self.down_proj.half()
-        self.up_proj.half()
-
-        self._init_param()
-
-    def _init_param(self):
-        with torch.no_grad():
-            nn.init.xavier_uniform_(self.down_proj.weight)
-            nn.init.zeros_(self.up_proj.weight)
-            nn.init.zeros_(self.down_proj.bias)
-            nn.init.zeros_(self.up_proj.bias)
-
-    def forward(self, x):
-        residual = x
-
-        down = self.down_proj(x)
-        down = self.non_linear_func(down)
-        up = self.up_proj(down)
-
-        return up * self.scale + residual
-
-
-class Adapter_Learner(nn.Module):
-    def __init__(self, dim=768, layer_id=[11], attn=True, mlp=True, scale=1.0, down_rate=8):
-        super().__init__()
-
-        _adapter = Adapter(dim, scale, down_rate)
-
-        # default: both vision/langauge transformers have 12 layers
-        # should be modified if more layers are used, e.g., ViT-L
-        if attn:
-            self.adapt_attn = nn.ModuleList([deepcopy(_adapter) if i in layer_id else nn.Identity() for i in range(12)])
-        else:
-            self.adapt_attn = nn.ModuleList([nn.Identity() for _ in range(12)])
-
-        if mlp:
-            self.adapt_mlp = nn.ModuleList([deepcopy(_adapter) if i in layer_id else nn.Identity() for i in range(12)])
-        else:
-            self.adapt_mlp = nn.ModuleList([nn.Identity() for _ in range(12)])
-
-    def forward(self, x, layer_id = None, pos = None):
-        assert pos in ['attn', 'mlp']
-        if pos == 'attn':
-            return self.adapt_attn[layer_id](x)
-        else:
-            return self.adapt_mlp[layer_id](x)
-
-
 class GaussianProjector(nn.Module):
     def __init__(self, n_dim, latent_dim=512, num_classes=10):
         super(GaussianProjector, self).__init__()
@@ -107,7 +46,7 @@ class GaussianProjector(nn.Module):
             nn.Linear(n_dim, n_dim * 2 * self.num_classes),
             nn.GELU(),
             nn.Linear(n_dim * 2 * self.num_classes, n_dim * 2 * self.num_classes)
-        ).half()
+        )
 
         self._init_param()
     
@@ -162,42 +101,41 @@ class GaussianProjector(nn.Module):
             return z, mean, logvar, kl_loss
 
 
+class LiearProjector(nn.Module):
+    def __init__(self, n_dim):
+        super(LiearProjector, self).__init__()
+        self.linear = nn.Linear(n_dim, n_dim)
+        self._init_param()
+
+    def _init_param(self):
+        with torch.no_grad():
+            nn.init.kaiming_uniform_(self.linear.weight)
+            # nn.init.normal_(self.linear.weight, std=0.01)
+            nn.init.zeros_(self.linear.bias)
+        
+    def forward(self, x):
+        return self.linear(x)
+
+
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
 
-        # Adapter module for vision transformer
-        if cfg.Adapter.Visual:
-            self.visual_adapter_learner = Adapter_Learner(
-                    clip_model.visual.ln_post.weight.shape[0],
-                    cfg.Adapter.Layer_ID, cfg.Adapter.Attn, cfg.Adapter.MLP, 
-                    cfg.Adapter.Scale, cfg.Adapter.Down_Rate
-                )
-        else:
-            self.visual_adapter_learner = None
-
-        # Adapter module for text transformer
-        if cfg.Adapter.Text:
-            self.text_adapter_learner = Adapter_Learner(
-                    clip_model.ln_final.weight.shape[0],
-                    cfg.Adapter.Layer_ID, cfg.Adapter.Attn, cfg.Adapter.MLP, 
-                    cfg.Adapter.Scale, cfg.Adapter.Down_Rate
-                )
-        else:
-            self.text_adapter_learner = None
-
         ndim = clip_model.ln_final.weight.shape[0]
-        self.noise_modulator_visual = GaussianProjector(ndim)
-        self.noise_modulator_text = GaussianProjector(ndim)
+        self.gaussian_projector_visual = GaussianProjector(ndim)
+        self.gaussian_projector_text = GaussianProjector(ndim)
 
-        self.adapter_learners = nn.ModuleDict({
-                "visual_adapter_learner": self.visual_adapter_learner,
-                "text_adapter_learner": self.text_adapter_learner,
-            })
-        
-        self.noise_modulator = nn.ModuleDict({
-            "noise_modulator_visual": self.noise_modulator_visual,
-            "noise_modulator_text": self.noise_modulator_text,
+        self.linear_projector_visual = LiearProjector(ndim)
+        self.linear_projector_text = LiearProjector(ndim)
+
+        self.gaussian_projector = nn.ModuleDict({
+            "gaussian_projector_visual": self.gaussian_projector_visual,
+            "gaussian_projector_text": self.gaussian_projector_text,
+        })
+
+        self.linear_projector = nn.ModuleDict({
+            "linear_projector_visual": self.linear_projector_visual,
+            "linear_projector_text": self.linear_projector_text,
         })
 
         self.clip_model = clip_model
@@ -218,6 +156,7 @@ class CustomCLIP(nn.Module):
             classnames = get_classnames(dataset_name)
         
         self.n_cls = len(classnames)
+        self.num_desc = cfg.LLM.Num_desc + 1
         # get LLM descriptors
         if dataset_name in ['imagenetv2', 'imagenet_a']:
             description_file = osp.join(cfg.LLM.PATH, f'imagenet.json')
@@ -239,14 +178,13 @@ class CustomCLIP(nn.Module):
 
         return prompts.reshape(len(classnames), cfg.LLM.Num_desc+1, 77).cuda()
 
-    def forward(self, image):
+    def forward(self, image, label):
         # forward function for training
         # image: batch size x aug time x 3 x 224 x 224
-        bs, aug_time, _, _, _ = image.shape
         image = image.reshape(-1, 3, 224, 224)
 
         # student model
-        image_features = self.clip_model.encode_image(image, self.visual_adapter_learner) # (bs x aug_time) x 512
+        image_features = self.clip_model.encode_image(image, None) # (bs x aug_time) x 512
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
         # sample sub-set texts for efficient training
@@ -256,12 +194,14 @@ class CustomCLIP(nn.Module):
             ], dim=1).reshape(-1, 77) # (n_cls x desc_per_batch) x 77
         
         # student model
-        text_features = self.clip_model.encode_text(sub_texts, self.text_adapter_learner) # (n_cls x desc_per_batch) x 512
+        text_features = self.clip_model.encode_text(sub_texts, None) # (n_cls x desc_per_batch) x 512
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
-        return image_features, text_features
+        image_features_z, text_features_z, wass_loss = self.wasserstein2(image_features, text_features, label)
+
+        return image_features, text_features, image_features_z, text_features_z, wass_loss
     
-    def vae(self, image_features, text_features, label):
+    def wasserstein2_(self, image_features, text_features, label):
         # image: (bs x aug_time) x 512
         # text: (n_cls x desc_per_batch) x 512
         # label: bs x 1
@@ -274,8 +214,11 @@ class CustomCLIP(nn.Module):
         # create text label. (n_cls x desc_per_batch) x 1
         label_text = torch.arange(self.n_cls).unsqueeze(1).repeat(1, self.desc_per_batch).reshape(-1).to(label.device)
 
-        image_features_z, _, _, kl_loss_img = self.noise_modulator_visual(image_features, label_image)
-        text_features_z, _, _, kl_loss_text = self.noise_modulator_text(text_features, label_text)
+        image_features_z_, _, _, kl_loss_img = self.gaussian_projector_visual(image_features, label_image)
+        text_features_z_, _, _, kl_loss_text = self.gaussian_projector_text(text_features, label_text)
+
+        image_features_z = self.linear_projector_visual(image_features)
+        text_features_z = self.linear_projector_text(text_features)
 
         image_features_z = image_features_z.view(bs, aug_time, -1) # bs x aug_time x 512
         text_features_z = text_features_z.view(self.n_cls, self.desc_per_batch, -1) # n_cls x desc_per_batch x 512
@@ -288,8 +231,8 @@ class CustomCLIP(nn.Module):
         text_features_center = text_features_z - mean_text.unsqueeze(1)
 
         # calculate covariance matrix (divide by (B-1) for Beesel correction)
-        cov_visual = (image_features_center.transpose(1, 2) @ image_features_center) / (aug_time - 1) # bs x 512 x 512
-        cov_text = (text_features_center.transpose(1, 2) @ text_features_center) / (self.desc_per_batch - 1) # n_cls x 512 x 512
+        cov_visual = (image_features_center.transpose(1, 2) @ image_features_center) / (bs*aug_time - 1) # bs x 512 x 512
+        cov_text = (text_features_center.transpose(1, 2) @ text_features_center) / (self.desc_per_batch*self.n_cls - 1) # n_cls x 512 x 512
 
         wass_loss = 0
         for i, l in enumerate(label):
@@ -320,12 +263,38 @@ class CustomCLIP(nn.Module):
         image_features_z = image_features_z.view(bs*aug_time, -1)
         text_features_z = text_features_z.view(self.n_cls*self.desc_per_batch, -1)
 
-        return image_features_z, text_features_z, kl_loss_img, kl_loss_text, wass_loss
+        return image_features_z, text_features_z, wass_loss
+
+
+    def wasserstein2(self, image_features, text_features, label):
+
+        bs = label.size(0)
+        aug_time = image_features.size(0) // bs
+
+        image_features_z = self.linear_projector_visual(image_features)
+        text_features_z = self.linear_projector_text(text_features)
+
+        image_features_z = image_features_z.view(bs, aug_time, -1) # bs x aug_time x 512
+        text_features_z = text_features_z.view(self.n_cls, self.desc_per_batch, -1) # n_cls x desc_per_batch x 512
+
+        wass_loss = 0
+        for i, l in enumerate(label):
+            image_feature_z = image_features_z[i]
+            text_feature_z = text_features_z[l]
+
+            wass_loss += Wasserstein_Distance(image_feature_z, text_feature_z)
+
+        wass_loss = wass_loss.mean()
+        image_features_z = image_features_z.view(bs*aug_time, -1)
+        text_features_z = text_features_z.view(self.n_cls*self.desc_per_batch, -1)
+
+        return image_features_z, text_features_z, wass_loss
 
     @torch.no_grad()
     def get_text_features(self, ):
-        text_features = self.clip_model.encode_text(self.texts.reshape(-1, 77), self.text_adapter_learner)
+        text_features = self.clip_model.encode_text(self.texts.reshape(-1, 77), None)
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+        text_features = self.linear_projector_text(text_features)
         return text_features
 
     @torch.no_grad()
@@ -334,43 +303,32 @@ class CustomCLIP(nn.Module):
         text_features = text_features / text_features.norm(dim=-1, keepdim=True)
 
         label_text = torch.arange(self.n_cls).unsqueeze(1).repeat(1, self.desc_per_batch).reshape(-1).to(text_features.device)
-        self.noise_modulator_text.eval()
-        text_features_z, _, _ = self.noise_modulator_text.encode(text_features, label_text)
+        self.gaussian_projector_text.eval()
+        text_features_z, _, _ = self.gaussian_projector_text.encode(text_features, label_text)
 
         return text_features_z
 
     @torch.no_grad()
-    def inference(self, image, text_features):
-        # forward function for testing
-        # image: batch size x aug time x 3 x 224 x 224
+    def inference(self, image, text_features_z):
         bs, aug_time, _, _, _ = image.shape
         image = image.reshape(-1, 3, 224, 224)
-        image_features = self.clip_model.encode_image(image, self.visual_adapter_learner)
+        image_features = self.clip_model.encode_image(image, None)
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
-        # (bs x aug_time) x (n_cls x self.tot_desc)
-        logits = self.logit_scale.exp() * image_features @ text_features.t()
-        logits = logits.reshape(bs, aug_time, self.n_cls, self.tot_desc).permute(0, 1, 3, 2).contiguous()
-        wass_dist = Wasserstein_Distance(logits, self.logit_scale, False)
-
-        return wass_dist
-
-    @torch.no_grad()
-    def inference_(self, image, text_features_z):
-        bs, aug_time, _, _, _ = image.shape
-        image = image.reshape(-1, 3, 224, 224)
-        image_features = self.clip_model.encode_image(image, self.visual_adapter_learner)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
-        image_features_z = self.noise_modulator_visual(image_features)
+        #image_features_z = self.gaussian_projector_visual(image_features)
+        image_features_z = self.linear_projector_visual(image_features)
 
         image_features_z = image_features_z.view(-1, 512)
 
-        logits = image_features_z @ text_features_z.T # (bs x aug_time) x (Num_desc x n_cls)
+        dist = torch.cdist(image_features_z, text_features_z) # (bs x aug_time) x (desc_per_batch x n_cls)
+        dist = dist.reshape(bs, aug_time, self.n_cls, self.num_desc)
+        
+        dist = dist.min(dim=1)[0]
+        dist = dist.min(dim=-1)[0] # [1, bs x n_cls]
+        dist = dist.reshape(bs, self.n_cls) # # bs x n_cls
+        dist = -dist
 
-        dist = torch.cdist(image_features_z, text_features_z)
-        idx = dist.argmin(dim=1).item()
-
+        return dist
 
 @TRAINER_REGISTRY.register()
 class AWT_RESAMPLE(TrainerX):
@@ -386,42 +344,43 @@ class AWT_RESAMPLE(TrainerX):
         clip_model = load_clip_to_cpu(cfg)
 
         print("Building custom CLIP")
-        self.model = CustomCLIP(cfg, classnames, clip_model)
+        self.model = CustomCLIP(cfg, classnames, clip_model).to(torch.float32)
 
         print("Turning off gradients in both the image and the text encoder")
         for name, param in self.model.named_parameters():
-            if "adapter_learner" not in name:
+            if "linear_projector" not in name:
                 param.requires_grad_(False)
-            if "noise_modulator" in name:
-                param.requires_grad_(True)
+
+        # Double check
+        enabled = set()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                enabled.add(name)
+        print(f"Parameters to be updated: {enabled}")
 
         print("Trainable params:", sum(p.numel() for p in self.model.parameters() if p.requires_grad))
 
-        if cfg.MODEL.INIT_WEIGHTS:
-            load_pretrained_weights(self.model.adapter_learners, cfg.MODEL.INIT_WEIGHTS)
+        # if cfg.MODEL.INIT_WEIGHTS:
+        #     load_pretrained_weights(self.model.adapter_learners, cfg.MODEL.INIT_WEIGHTS)
 
         self.model.to(self.device)
-        # NOTE: only give adapter_learner to the optimizer
-        self.optim = build_optimizer(self.model.adapter_learners, cfg.OPTIM)
-        self.sched = build_lr_scheduler(self.optim, cfg.OPTIM)
-        self.register_model("adapter_learners", self.model.adapter_learners, self.optim, self.sched)
+        
+        self.optim_gaussian = build_optimizer(self.model.gaussian_projector, cfg.OPTIM)
+        self.sched_gaussian = build_lr_scheduler(self.optim_gaussian, cfg.OPTIM)
+        self.register_model("gaussian_projector", self.model.gaussian_projector, self.optim_gaussian, self.sched_gaussian)
 
-        self.optim_noise = build_optimizer(self.model.noise_modulator, cfg.OPTIM)
-        self.sched_noise = build_lr_scheduler(self.optim_noise, cfg.OPTIM)
-        self.register_model("noise_modulator", self.model.noise_modulator, self.optim_noise, self.sched_noise)
+        self.optim_linear = build_optimizer(self.model.linear_projector, cfg.OPTIM_PROJ)
+        self.sched_linear = build_lr_scheduler(self.optim_linear, cfg.OPTIM_PROJ)
+        self.register_model("linear_projector", self.model.linear_projector, self.optim_linear, self.sched_linear)
+
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
 
         bs, aug_time, _, _, _ = image.shape
 
-        image_features, text_features = self.model(image)
-        image_features_z, text_features_z, kl_loss_img, kl_loss_text, wass_loss = self.model.vae(image_features, text_features, label)
+        image_features, text_features, image_features_z, text_features_z, wass_loss = self.model(image, label)
 
-        # logits = self.model.logit_scale.exp() * image_features @ text_features.t()
-        # logits = logits.reshape(bs, aug_time, self.model.n_cls, self.model.desc_per_batch).permute(0, 1, 3, 2).contiguous()
-        # output = Wasserstein_Distance(logits, self.model.logit_scale, True) # bs x n_cls
-        #import pdb; pdb.set_trace()
         output = torch.cdist(image_features_z, text_features_z) # (bs x aug_time) x (desc_per_batch x n_cls)
         output = output.reshape(bs, aug_time, self.model.n_cls, self.model.desc_per_batch)
         
@@ -431,18 +390,13 @@ class AWT_RESAMPLE(TrainerX):
         output = -output
 
         loss_ce = F.cross_entropy(output, label)
-        wass_loss = wass_loss * 0.0001
-        kl_loss_img = kl_loss_img * 0.1
-        kl_loss_text = kl_loss_text * 0.1
-        
-        #loss = loss_ce
-        loss = kl_loss_img + kl_loss_text + loss_ce + wass_loss
-        self.model_backward_and_update(loss)
+        wass_loss = wass_loss * 0.1
+
+        loss = loss_ce + wass_loss
+        self.model_backward_and_update(loss, names="linear_projector")
 
         loss_summary = {
             "loss_ce": loss_ce.item(),
-            "kl_loss_img": kl_loss_img.item(),
-            "kl_loss_text": kl_loss_text.item(),
             "wass_loss": wass_loss.item(),
             "loss": loss.item(),
             "acc": compute_accuracy(output, label)[0].item(),
