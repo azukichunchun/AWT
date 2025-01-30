@@ -30,7 +30,7 @@ def Sinkhorn(K, u, v, thresh=1e-2, max_iter=200):
     return T
 
 
-def optimal_transport(image_features, text_features, eps=1, thresh=1e-2, max_iter=200):
+def optimal_transport(image_features, text_features, eps=0.1, thresh=1e-3, max_iter=200):
     # image_features: aug_time x d, text_features: n_des x d
     aug_time = image_features.shape[0]
     n_des = text_features.shape[0]

@@ -199,8 +199,8 @@ class DatasetWrapper(TorchDataset):
         self.transform = transform  # accept list (tuple) as input
         self.is_train = is_train
         # Augmenting an image K>1 times is only allowed during training
-        self.k_tfm = cfg.DATALOADER.K_TRANSFORMS
-        # self.k_tfm = cfg.DATALOADER.K_TRANSFORMS if is_train else 1
+        #self.k_tfm = cfg.DATALOADER.K_TRANSFORMS
+        self.k_tfm = cfg.DATALOADER.K_TRANSFORMS if is_train else 1
         self.return_img0 = cfg.DATALOADER.RETURN_IMG0
 
         if self.k_tfm > 1 and transform is None:
