@@ -15,7 +15,16 @@ from dassl.optim import build_optimizer, build_lr_scheduler
 from clip import clip
 from datasets.cls_to_names import CUSTOM_TEMPLATES, Dataset_Name_Map, get_classnames
 from .ot_tools import Wasserstein_Distance
+from .loading_helpers import wordify
+from .explainer import interpret
 
+DESCRIPTION_PATH = {
+    IMAGENET_DIR: '/path/to/your/dataset/', # REPLACE THIS WITH YOUR OWN PATH
+    CUB_DIR: '/path/to/your/dataset/', # REPLACE THIS WITH YOUR OWN PATH
+    EUROSAT_DIR: '/path/to/your/dataset/', # REPLACE THIS WITH YOUR OWN PATH
+    OXFORDPET_DIR: '/home/yhiro/CoOp_/data', # REPLACE THIS WITH YOUR OWN PATH
+    FOOD101_DIR: '/path/to/your/dataset/', # REPLACE THIS WITH YOUR OWN PATH
+}
 
 def load_clip_to_cpu(cfg):
     backbone_name = cfg.MODEL.BACKBONE.NAME
@@ -133,38 +142,54 @@ class CustomCLIP(nn.Module):
         self.tot_desc = cfg.LLM.Num_desc + 1
         self.classnames = classnames
         self.texts = self.get_text_input(cfg) # n_cls x n_desc+1 x 77
+        self.descriptions = self.get_descriptions(cfg)
+        self.concepts, self.rich_label = self.get_concept_features()
+
+
+    @torch.no_grad()
+    def get_descriptions(self, cfg):
+        fpath_description = DESCRIPTION_PATH[cfg.DATASET.NAME]
+        with open(fpath_description, 'r') as f:
+            descriptions = json.load(f)
+        return descriptions
         
     @torch.no_grad()
-    def get_text_input(self, cfg):
-        dataset_name = Dataset_Name_Map[cfg.DATASET.NAME]
-        if dataset_name == 'imagenetv2':
-            classnames = self.classnames
-        else:
-            classnames = get_classnames(dataset_name)
-        
-        self.n_cls = len(classnames)
-        # get LLM descriptors
-        if dataset_name in ['imagenetv2', 'imagenet_a']:
-            description_file = osp.join(cfg.LLM.PATH, f'imagenet.json')
-        else:
-            description_file = osp.join(cfg.LLM.PATH, f'{dataset_name}.json')
-        print(f'Using description file: {description_file}')
-        llm_descriptions = json.load(open(description_file))
+    def get_concept_features(self, cfg):
+        concepts = {}
+        for k, v in self.descriptions.items():
+            concept = v[:cfg.TRAIN.K_CONCEPTS] # get top 5 concepts
+            concatenated_concept = ', '.join(concept)
+            rich_label = f"{wordify(k)} It may contains {concatenated_concept}"
 
-        template = CUSTOM_TEMPLATES[dataset_name]
-        prompts = []
-        for classname in classnames:
-            prompt = template.format(classname.replace("_", " "))
-            prompts.append(prompt + '.')
-            assert len(llm_descriptions[classname]) >= cfg.LLM.Num_desc
-            for i in range(cfg.LLM.Num_desc):
-                prompt_desc = prompt + '. ' + llm_descriptions[classname][i]
-                prompts.append(prompt_desc)
-        prompts = torch.cat([clip.tokenize(p) for p in prompts])
+            concept.insert(0, k) # insert class name to the first element (e.g., ['zebra', 'striped', 'mammal', 'animal', 'wildlife', 'safari'])
+            tokenized_concept = self.clip_model.tokenize(concept)
+            concepts[k] = tokenized_concept
 
-        return prompts.reshape(len(classnames), cfg.LLM.Num_desc+1, 77).cuda()
+        return concepts, rich_label
+    
+    def forward(self, image, label=None):
+        # image: (bs, 3, 224, 224)
+        # label: (bs, )
 
-    def forward(self, image):
+        # labelからconceptを取得
+        concepts = []
+        for l in label:
+            concepts.append(self.concepts[self.classnames[l]])
+        concepts = torch.stack(concepts, dim=0)
+
+        # 画像ごとにヒートマップを作成
+        attn_map = []
+        for k in range(len(image)):
+            R_image = interpret(image_encoder=self.clip_model.encode_image,
+                                text_encoder=self.clip_model.encode_text, 
+                                logit_scale=self.logit_scale,
+                                image=image[k].unsqueeze(0), 
+                                texts=concepts[k].to(self.device), device=self.device)
+            image_relevance = R_image[0]
+            dim = int(image_relevance.numel() ** 0.5)
+            R_image = R_image.reshape(-1, dim, dim)
+            attn_map.append(R_image)
+
         # forward function for training
         # image: batch size x aug time x 3 x 224 x 224
         bs, aug_time, _, _, _ = image.shape
