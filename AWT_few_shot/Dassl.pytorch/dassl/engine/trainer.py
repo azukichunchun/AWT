@@ -360,7 +360,7 @@ class SimpleTrainer(TrainerBase):
     def build_model(self):
         """Build and register model.
 
-        The default builds a classification model along with its
+        The default builds a classification fmodel along with its
         optimizer and scheduler.
 
         Custom trainers can re-implement this method if necessary.

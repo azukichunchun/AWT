@@ -1,5 +1,8 @@
 import os.path as osp
+import string
+import random
 
+from tqdm import tqdm
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -9,6 +12,7 @@ from dassl.engine import TRAINER_REGISTRY, TrainerX
 from dassl.metrics import compute_accuracy
 from dassl.utils import load_pretrained_weights, load_checkpoint
 from dassl.optim import build_optimizer, build_lr_scheduler
+from dassl.evaluation import build_evaluator
 
 from clip import clip
 from clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
@@ -109,13 +113,22 @@ class PromptLearner(nn.Module):
         self.register_buffer("token_prefix", embedding[:, :1, :])  # SOS
         self.register_buffer("token_suffix", embedding[:, 1 + n_ctx :, :])  # CLS, EOS
 
+        self.cfg = cfg
+        self.dtype = dtype   
         self.n_cls = n_cls
         self.n_ctx = n_ctx
+        self.token_embedding = clip_model.token_embedding
+        self.prompt_prefix = prompt_prefix
+        self.classnames = classnames
         self.tokenized_prompts = tokenized_prompts  # torch.Tensor
         self.name_lens = name_lens
         self.class_token_position = cfg.TRAINER.COOP.CLASS_TOKEN_POSITION
 
-    def forward(self):
+    def generate_random_text(self, noise_length=4):
+        random_text = ''.join(random.choices(string.ascii_letters + string.digits + string.punctuation, k=noise_length))
+        return random_text
+    
+    def forward(self, noise=False):
         ctx = self.ctx
         if ctx.dim() == 2:
             ctx = ctx.unsqueeze(0).expand(self.n_cls, -1, -1)
@@ -123,7 +136,7 @@ class PromptLearner(nn.Module):
         prefix = self.token_prefix
         suffix = self.token_suffix
 
-        if self.class_token_position == "end":
+        if not noise:
             prompts = torch.cat(
                 [
                     prefix,  # (n_cls, 1, dim)
@@ -133,70 +146,47 @@ class PromptLearner(nn.Module):
                 dim=1,
             )
 
-        elif self.class_token_position == "middle":
-            half_n_ctx = self.n_ctx // 2
-            prompts = []
-            for i in range(self.n_cls):
-                name_len = self.name_lens[i]
-                prefix_i = prefix[i : i + 1, :, :]
-                class_i = suffix[i : i + 1, :name_len, :]
-                suffix_i = suffix[i : i + 1, name_len:, :]
-                ctx_i_half1 = ctx[i : i + 1, :half_n_ctx, :]
-                ctx_i_half2 = ctx[i : i + 1, half_n_ctx:, :]
-                prompt = torch.cat(
-                    [
-                        prefix_i,     # (1, 1, dim)
-                        ctx_i_half1,  # (1, n_ctx//2, dim)
-                        class_i,      # (1, name_len, dim)
-                        ctx_i_half2,  # (1, n_ctx//2, dim)
-                        suffix_i,     # (1, *, dim)
-                    ],
-                    dim=1,
-                )
-                prompts.append(prompt)
-            prompts = torch.cat(prompts, dim=0)
-
-        elif self.class_token_position == "front":
-            prompts = []
-            for i in range(self.n_cls):
-                name_len = self.name_lens[i]
-                prefix_i = prefix[i : i + 1, :, :]
-                class_i = suffix[i : i + 1, :name_len, :]
-                suffix_i = suffix[i : i + 1, name_len:, :]
-                ctx_i = ctx[i : i + 1, :, :]
-                prompt = torch.cat(
-                    [
-                        prefix_i,  # (1, 1, dim)
-                        class_i,   # (1, name_len, dim)
-                        ctx_i,     # (1, n_ctx, dim)
-                        suffix_i,  # (1, *, dim)
-                    ],
-                    dim=1,
-                )
-                prompts.append(prompt)
-            prompts = torch.cat(prompts, dim=0)
-
+            return prompts, self.tokenized_prompts
         else:
-            raise ValueError
+            noise_text = self.generate_random_text()
+            noise_tokenized = clip.tokenize(noise_text)
+            # embedding of noise text excluding SOS and EOS tokens
+            with torch.no_grad():
+                noise_embedding = self.token_embedding(noise_tokenized.to(prefix.device)).type(self.dtype)
+            noise_emb = noise_embedding[:, 1:noise_tokenized.argmax(), :]  # shape: (1, L_noise-2, dim)
+            noise_emb = noise_emb.expand(self.n_cls, -1, -1)  # shape: (n_cls, L_noise-2, dim)
 
-        return prompts
-
+            prompts = torch.cat(
+                [
+                    prefix,  # (n_cls, 1, dim)
+                    ctx,     # (n_cls, n_ctx, dim)
+                    noise_emb,  # (n_cls, L_noise-2, dim)
+                    suffix[:, :-noise_emb.shape[1], :],  # (n_cls, *, dim)
+                ],
+                dim=1,
+            )
+            # create new prompts with noise text
+            new_prompt_texts = []
+            for i in range(self.n_cls):
+                new_text = self.prompt_prefix + " " + noise_text + " " + self.classnames[i] + "."
+                new_prompt_texts.append(new_text)
+            tokenized_prompts = torch.cat([clip.tokenize(t) for t in new_prompt_texts])
+            return prompts, tokenized_prompts
 
 class CustomCLIP(nn.Module):
     def __init__(self, cfg, classnames, clip_model):
         super().__init__()
         self.prompt_learner = PromptLearner(cfg, classnames, clip_model)
-        self.tokenized_prompts = self.prompt_learner.tokenized_prompts
+        #self.tokenized_prompts = self.prompt_learner
         self.image_encoder = clip_model.visual
         self.text_encoder = TextEncoder(clip_model)
         self.logit_scale = clip_model.logit_scale
         self.dtype = clip_model.dtype
 
-    def forward(self, image):
+    def forward(self, image, noise=False):
         image_features = self.image_encoder(image.type(self.dtype))
 
-        prompts = self.prompt_learner()
-        tokenized_prompts = self.tokenized_prompts
+        prompts, tokenized_prompts = self.prompt_learner(noise=noise)        
         text_features = self.text_encoder(prompts, tokenized_prompts)
 
         image_features = image_features / image_features.norm(dim=-1, keepdim=True)
@@ -209,7 +199,7 @@ class CustomCLIP(nn.Module):
 
 
 @TRAINER_REGISTRY.register()
-class CoOp(TrainerX):
+class CoOp_Noise(TrainerX):
     """Context Optimization (CoOp).
 
     Learning to Prompt for Vision-Language Models
@@ -251,10 +241,10 @@ class CoOp(TrainerX):
 
         # Note that multi-gpu training could be slow because CLIP's size is
         # big, which slows down the copy operation in DataParallel
-        device_count = torch.cuda.device_count()
-        if device_count > 1:
-            print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
-            self.model = nn.DataParallel(self.model)
+        # device_count = torch.cuda.device_count()
+        # if device_count > 1:
+        #     print(f"Multiple GPUs detected (n_gpus={device_count}), use all of them!")
+        #     self.model = nn.DataParallel(self.model)
 
     def forward_backward(self, batch):
         image, label = self.parse_batch_train(batch)
@@ -323,3 +313,47 @@ class CoOp(TrainerX):
             print("Loading weights to {} " 'from "{}" (epoch = {})'.format(name, model_path, epoch))
             # set strict=False
             self._models[name].load_state_dict(state_dict, strict=False)
+
+    def model_inference(self, input, noise=False):
+        return self.model(input, noise=noise)
+
+    @torch.no_grad()
+    def test(self, split=None):
+        """A generic testing pipeline."""
+        self.set_model_mode("eval")
+        self.evaluator = build_evaluator(self.cfg, lab2cname=self.lab2cname)
+        self.evaluator_noise = build_evaluator(self.cfg, lab2cname=self.lab2cname)
+
+        self.evaluator.reset()
+        self.evaluator_noise.reset()
+
+        if split is None:
+            split = self.cfg.TEST.SPLIT
+
+        if split == "val" and self.val_loader is not None:
+            data_loader = self.val_loader
+        else:
+            split = "test"  # in case val_loader is None
+            data_loader = self.test_loader
+
+        print(f"Evaluate on the *{split}* set")
+
+        for batch_idx, batch in enumerate(tqdm(data_loader)):
+            input, label = self.parse_batch_test(batch)
+            output1 = self.model_inference(input, noise=False)
+            output2 = self.model_inference(input, noise=True)
+            self.evaluator.process(output1, label)
+            self.evaluator_noise.process(output2, label)
+
+        results1 = self.evaluator.evaluate()
+        results2 = self.evaluator_noise.evaluate()
+
+        for k, v in results1.items():
+            tag = f"{split}/{k}"
+            self.write_scalar(tag, v, self.epoch)
+        
+        for k, v in results2.items():
+            tag = f"{split}/{k}_noise"
+            self.write_scalar(tag, v, self.epoch)
+
+        return list(results1.values())[0], list(results2.values())[0]

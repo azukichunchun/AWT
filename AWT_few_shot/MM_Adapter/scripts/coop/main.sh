@@ -2,7 +2,8 @@
 
 # custom config
 DATA=/mnt/petrelfs/zhaozhiyu/zhuyuhan/CoOp_dataset
-TRAINER=CoOp
+DATA=~/CoOp_/data/
+TRAINER=CoOp_Noise
 
 DATASET=$1
 CFG=$2  # config file
@@ -11,11 +12,12 @@ NCTX=$4  # number of context tokens
 SHOTS=$5  # number of shots (1, 2, 4, 8, 16)
 CSC=$6  # class-specific context (False or True)
 
-for SEED in 1 2 3
+for SEED in 1
 do
     DIR=output/${DATASET}/${TRAINER}/${CFG}_${SHOTS}shots/nctx${NCTX}_csc${CSC}_ctp${CTP}/seed${SEED}
     if [ -d "$DIR" ]; then
         echo "Oops! The results exist at ${DIR} (so skip this job)"
+        echo ${DATA}
     else
         python train.py \
         --root ${DATA} \

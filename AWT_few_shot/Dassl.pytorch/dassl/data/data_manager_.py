@@ -19,7 +19,7 @@ def build_data_loader(
     n_ins=2,
     tfm=None,
     is_train=True,
-    dataset_wrapper=None
+    dataset_wrapper=None,
 ):
     # Build sampler
     sampler = build_sampler(
@@ -33,6 +33,7 @@ def build_data_loader(
 
     if dataset_wrapper is None:
         dataset_wrapper = DatasetWrapper
+
 
     # Build data loader
     data_loader = torch.utils.data.DataLoader(
@@ -73,6 +74,9 @@ class DataManager:
             print("* Using custom transform for testing")
             tfm_test = custom_tfm_test
 
+        # get ready for dual transform
+        tfm_all = [tfm_train, tfm_test]
+        
         # Build train_loader_x
         train_loader_x = build_data_loader(
             cfg,
@@ -81,7 +85,8 @@ class DataManager:
             batch_size=cfg.DATALOADER.TRAIN_X.BATCH_SIZE,
             n_domain=cfg.DATALOADER.TRAIN_X.N_DOMAIN,
             n_ins=cfg.DATALOADER.TRAIN_X.N_INS,
-            tfm=tfm_train,
+            # tfm=tfm_train,
+            tfm = tfm_all,
             is_train=True,
             dataset_wrapper=dataset_wrapper
         )
@@ -120,7 +125,8 @@ class DataManager:
                 sampler_type=cfg.DATALOADER.TEST.SAMPLER,
                 data_source=dataset.val,
                 batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
-                tfm=tfm_test,
+                # tfm=tfm_test,
+                tfm = tfm_all,
                 is_train=False,
                 dataset_wrapper=dataset_wrapper
             )
@@ -131,7 +137,8 @@ class DataManager:
             sampler_type=cfg.DATALOADER.TEST.SAMPLER,
             data_source=dataset.test,
             batch_size=cfg.DATALOADER.TEST.BATCH_SIZE,
-            tfm=tfm_test,
+            # tfm=tfm_test,
+            tfm = tfm_all,
             is_train=False,
             dataset_wrapper=dataset_wrapper
         )
@@ -187,12 +194,14 @@ class DataManager:
 
 class DatasetWrapper(TorchDataset):
 
-    def __init__(self, cfg, data_source, transform=None, is_train=False):
+    def __init__(self, cfg, data_source, transform=None, is_train=False, query_weights=None):
         self.cfg = cfg
         self.data_source = data_source
         self.transform = transform  # accept list (tuple) as input
         self.is_train = is_train
+        self.query_weights = query_weights
         # Augmenting an image K>1 times is only allowed during training
+        #self.k_tfm = cfg.DATALOADER.K_TRANSFORMS
         self.k_tfm = cfg.DATALOADER.K_TRANSFORMS if is_train else 1
         self.return_img0 = cfg.DATALOADER.RETURN_IMG0
 
@@ -201,7 +210,9 @@ class DatasetWrapper(TorchDataset):
                 "Cannot augment the image {} times "
                 "because transform is None".format(self.k_tfm)
             )
-
+        # print(self.transform)
+        # print(self.transform[0])
+        # exit(0)
         # Build transform that doesn't apply any data augmentation
         interp_mode = INTERPOLATION_MODES[cfg.INPUT.INTERPOLATION]
         to_tensor = []
@@ -224,11 +235,11 @@ class DatasetWrapper(TorchDataset):
             "label": item.label,
             "domain": item.domain,
             "impath": item.impath,
-            "index": idx
+            "index": idx,
         }
 
         img0 = read_image(item.impath)
-
+        """
         if self.transform is not None:
             if isinstance(self.transform, (list, tuple)):
                 for i, tfm in enumerate(self.transform):
@@ -236,18 +247,26 @@ class DatasetWrapper(TorchDataset):
                     keyname = "img"
                     if (i + 1) > 1:
                         keyname += str(i + 1)
+                    print(keyname)
                     output[keyname] = img
             else:
                 img = self._transform_image(self.transform, img0)
                 output["img"] = img
         else:
             output["img"] = img0
-
+        """
+        # for dual transform
+        if self.transform is not None:
+            img = self._transform_image(self.transform, img0, self.is_train)
+            output["img"] = img
+        else:
+            output["img"] = img0
+        
         if self.return_img0:
             output["img0"] = self.to_tensor(img0)  # without any augmentation
 
         return output
-
+    """
     def _transform_image(self, tfm, img0):
         img_list = []
 
@@ -257,5 +276,25 @@ class DatasetWrapper(TorchDataset):
         img = img_list
         if len(img) == 1:
             img = img[0]
+
+        return img
+    """
+    # for dual transform
+    def _transform_image(self, tfm, img0, is_train):
+        img_list = []
+        
+        tfm_train, tfm_test = tfm
+        
+        if is_train:
+            tfm_test = tfm_train
+            
+        img_list.append(tfm_test(img0)) # when test, the first view applys simple aug
+        
+        for k in range(self.k_tfm - 1):
+            img_list.append(tfm_train(img0))
+
+        img = img_list
+        # if len(img) == 1:
+        #     img = img[0]
 
         return img

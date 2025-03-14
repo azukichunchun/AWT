@@ -24,8 +24,10 @@ import datasets.imagenet_a
 import datasets.imagenet_r
 
 import trainers.coop
+import trainers.coop_noise
 import trainers.cocoop
 import trainers.zsclip
+import trainers.zsclip_noise
 import trainers.awt_mixup
 import trainers.awt_pertubation
 import trainers.awt_resample
@@ -141,8 +143,8 @@ def setup_cfg(args):
     # 4. From optional input arguments
     cfg.merge_from_list(args.opts)
 
-    if args.eval_only:
-        cfg.DATALOADER.K_TRANSFORMS = 51
+    # if args.eval_only:
+    #     cfg.DATALOADER.K_TRANSFORMS = 51
 
     cfg.freeze()
 

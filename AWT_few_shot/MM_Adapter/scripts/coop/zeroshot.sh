@@ -2,7 +2,8 @@
 
 # custom config
 DATA=/path/to/datasets
-TRAINER=ZeroshotCLIP
+DATA=~/CoOp_/data/
+TRAINER=ZeroshotCLIP_Noise
 DATASET=$1
 CFG=$2  # rn50, rn101, vit_b32 or vit_b16
 
